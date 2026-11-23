@@ -77,22 +77,22 @@ func text(_ v: NSView, _ y: CGFloat, _ h: CGFloat, _ size: CGFloat, weight: NSFo
     let t = NSTextField(labelWithString: "")
     t.frame = NSRect(x: 0, y: y, width: v.frame.width, height: h); t.alignment = .center
     t.font = .systemFont(ofSize: size, weight: weight); t.textColor = NSColor.white.withAlphaComponent(alpha)
-    t.shadow = { let s = NSShadow(); s.shadowBlurRadius = 8; s.shadowColor = NSColor.black.withAlphaComponent(0.5); return s }()
+    t.shadow = { let s = NSShadow(); s.shadowBlurRadius = 14; s.shadowColor = NSColor.black.withAlphaComponent(0.22); return s }()   // lifts text off the glow, as on the lock screen
     v.addSubview(t); return t
 }
 
-/// One per display: the Apple Intelligence glow (github.com/jacobamobin/AppleIntelligenceGlowEffect, Livsy90/IntelligenceGlow) rebuilt in
-/// Core Animation, made organic. A conic gradient rotates on the GPU behind stroked masks (sharp + blurred halos, screen-blended so it
-/// reads as light). The masks trace a living squircle whose edge undulates with slow layered waves; it closes in from every edge as
-/// `level` goes 0 -> 1, frosting what lies outside it, and opens back out when posture is fixed. Once fully covered, the same glow
-/// moves to the screen border and keeps breathing and waving there.
+/// The warning, after the Apple Intelligence edge glow: light lives on the physical screen edge and floods inward as posture
+/// stays bad, with every boundary feathered (no hard line anywhere). Blur and colour follow one soft, slowly waving front;
+/// correcting posture pulls it back to the edge. Locked: the whole screen is frosted and tinted, the rim breathes.
 final class Liquid {
     static let palette: [NSColor] = ["BC82F3", "F5B9EA", "8D9FFF", "FF6778", "FFBA71", "C686FF"].map { h in
         let v = Int(h, radix: 16)!; return NSColor(srgbRed: CGFloat(v >> 16 & 255) / 255, green: CGFloat(v >> 8 & 255) / 255, blue: CGFloat(v & 255) / 255, alpha: 1) }
-    let win: KeyWin, blur = NSVisualEffectView(), dim = CALayer(), frontGlow = CALayer(), edgeGlow = CALayer(), frostMask = CAShapeLayer(), dimMask = CAShapeLayer()
-    var rings: [(mask: CAShapeLayer, width: CGFloat, edge: Bool)] = [], gradients: [CAGradientLayer] = []
+    let win: KeyWin, blur = NSVisualEffectView(), tint = CALayer(), rimGlow = CALayer(), frontGlow = CALayer(), bloom = CALayer()
+    let frostFeather = CAShapeLayer(), bloomFeather = CAShapeLayer()
+    var rings: [(mask: CAShapeLayer, width: CGFloat, rim: Bool)] = [], gradients: [CAGradientLayer] = []
     let content = NSView(), title: NSTextField, why: NSTextField, foot: NSTextField, button = NSButton()
-    var preview: NSView?, lastShuffle = -10.0
+    var preview: NSView?, lastShuffle = -10.0, shown = false
+    static let M: CGFloat = 180
     init(screen: NSScreen, session: AVCaptureSession, main: Bool, target: AnyObject, action: Selector) {
         let f = screen.frame, W = f.width, H = f.height
         win = KeyWin(contentRect: f, styleMask: .borderless, backing: .buffered, defer: false)
@@ -100,42 +100,59 @@ final class Liquid {
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]; win.ignoresMouseEvents = true
         win.appearance = NSAppearance(named: .darkAqua)
         let root = win.contentView!; root.wantsLayer = true
-        blur.material = .fullScreenUI; blur.blendingMode = .behindWindow; blur.state = .active; blur.frame = root.bounds; root.addSubview(blur)
-        blur.wantsLayer = true; frostMask.fillRule = .evenOdd; frostMask.frame = root.bounds; blur.layer?.mask = frostMask
+        blur.appearance = NSAppearance(named: .aqua); blur.material = .fullScreenUI; blur.blendingMode = .behindWindow; blur.state = .active; blur.frame = root.bounds; root.addSubview(blur)
+        blur.wantsLayer = true; frostFeather.frame = root.bounds; blur.layer?.mask = frostFeather
+        for m in [frostFeather, bloomFeather] { m.fillColor = nil; m.shadowColor = NSColor.black.cgColor; m.shadowOpacity = 1; m.shadowOffset = .zero }
         let host = NSView(frame: root.bounds); host.wantsLayer = true; host.layerUsesCoreImageFilters = true; root.addSubview(host)
-        dim.frame = host.bounds; dim.backgroundColor = NSColor(srgbRed: 0.10, green: 0.07, blue: 0.16, alpha: 0.34).cgColor; dimMask.fillRule = .evenOdd; dimMask.frame = host.bounds; dim.mask = dimMask; host.layer?.addSublayer(dim)
+        tint.frame = host.bounds; tint.backgroundColor = NSColor(srgbRed: 0.12, green: 0.08, blue: 0.22, alpha: 1).cgColor; tint.opacity = 0; host.layer?.addSublayer(tint)
         let side = hypot(W, H) + 80
         let spin = CABasicAnimation(keyPath: "transform.rotation.z"); spin.fromValue = 0; spin.toValue = -2 * Double.pi; spin.duration = 14; spin.repeatCount = .infinity
-        for (group, edge) in [(frontGlow, false), (edgeGlow, true)] {
-            group.frame = host.bounds; group.compositingFilter = "screenBlendMode"; host.layer?.addSublayer(group)
-            // (stroke width, blur radius): the original's 6/0, 9/4, 11/12, 15/15 layering, scaled for a desktop display
-            for (w, r) in [(CGFloat(9), CGFloat(3)), (16, 8), (26, 18), (46, 34)] {
-                let ring = CALayer(); ring.frame = host.bounds
-                if let b = CIFilter(name: "CIGaussianBlur") { b.setValue(r, forKey: kCIInputRadiusKey); ring.filters = [b] }
-                let clip = CALayer(); clip.frame = host.bounds
-                let m = CAShapeLayer(); m.frame = host.bounds; m.fillColor = nil; m.strokeColor = NSColor.white.cgColor; m.lineJoin = .round
-                clip.mask = m
-                let g = CAGradientLayer(); g.type = .conic; g.startPoint = CGPoint(x: 0.5, y: 0.5); g.endPoint = CGPoint(x: 0.5, y: 0)
-                g.bounds = CGRect(x: 0, y: 0, width: side, height: side); g.position = CGPoint(x: W / 2, y: H / 2); g.add(spin, forKey: "spin")
-                clip.addSublayer(g); ring.addSublayer(clip); group.addSublayer(ring)
-                rings.append((m, w, edge)); gradients.append(g)
+        var grads: [CAGradientLayer] = [], rs: [(mask: CAShapeLayer, width: CGFloat, rim: Bool)] = []
+        func conic(_ into: CALayer, _ o: CGFloat = 0) {
+            let g = CAGradientLayer(); g.type = .conic; g.startPoint = CGPoint(x: 0.5, y: 0.5); g.endPoint = CGPoint(x: 0.5, y: 0)
+            g.bounds = CGRect(x: 0, y: 0, width: side, height: side); g.position = CGPoint(x: W / 2 + o, y: H / 2 + o); g.add(spin, forKey: "spin")
+            into.addSublayer(g); grads.append(g)
+        }
+        func blurred(_ l: CALayer, _ r: CGFloat) { if let b = CIFilter(name: "CIGaussianBlur") { b.setValue(r, forKey: kCIInputRadiusKey); l.filters = [b] } }
+        // colour wash: the gradient itself, heavily blurred, shown through the same feathered region as the frost
+        bloom.frame = host.bounds; host.layer?.addSublayer(bloom)
+        let wash = CALayer(); wash.frame = host.bounds; blurred(wash, 70); conic(wash); bloom.addSublayer(wash)
+        bloomFeather.frame = host.bounds; bloom.mask = bloomFeather
+        // light: a bright rim hugging the display edge and a soft luminous wave on the front, each built from blurred strokes
+        // stroke layers reach M past the screen so the blur near the edge samples light, not emptiness
+        for (group, rim, layers) in [(rimGlow, true, [(CGFloat(4), CGFloat(2)), (10, 6), (22, 18), (44, 52)]),
+                                     (frontGlow, false, [(CGFloat(10), CGFloat(36))])] {
+            group.frame = host.bounds; host.layer?.addSublayer(group)
+            for (w, r) in layers {
+                let ring = CALayer(); ring.frame = host.bounds.insetBy(dx: -Liquid.M, dy: -Liquid.M); blurred(ring, r)
+                let clip = CALayer(); clip.frame = ring.bounds
+                let m = CAShapeLayer(); m.frame = ring.bounds; m.fillColor = nil; m.strokeColor = NSColor.white.cgColor; m.lineJoin = .round
+                clip.mask = m; conic(clip, Liquid.M); ring.addSublayer(clip); group.addSublayer(ring)
+                rs.append((m, w, rim))
             }
         }
-        content.frame = root.bounds; content.alphaValue = 0; root.addSubview(content)
-        title = text(content, H * 0.70, 96, 72, weight: .bold); why = text(content, H * 0.62, 44, 28, alpha: 0.92); foot = text(content, H * 0.07, 26, 16, alpha: 0.7)
+        content.frame = root.bounds; root.addSubview(content)
+        // one column stacked from the top, sized to the display so nothing overlaps on small screens
+        let ts = min(76, H * 0.085), top = H * 0.74, ph = min(315, H * 0.36), pw = ph * 4 / 3
+        title = text(content, top, ts * 1.3, ts, weight: .semibold); why = text(content, top - 42, 36, min(26, H * 0.032), weight: .medium, alpha: 0.9)
+        foot = text(content, H * 0.055, 24, 15, alpha: 0.7)
+        gradients = grads; rings = rs
         if main {
-            let pv = NSView(frame: NSRect(x: (W - 420) / 2, y: H * 0.26, width: 420, height: 315)); pv.wantsLayer = true
+            let pv = NSView(frame: NSRect(x: (W - pw) / 2, y: top - 66 - ph, width: pw, height: ph)); pv.wantsLayer = true
             let pl = AVCaptureVideoPreviewLayer(session: session); pl.frame = pv.bounds; pl.videoGravity = .resizeAspectFill
             pl.connection?.automaticallyAdjustsVideoMirroring = false; pl.connection?.isVideoMirrored = true
             pv.layer?.addSublayer(pl); pv.layer?.cornerRadius = 22; pv.layer?.masksToBounds = true
             pv.layer?.borderWidth = 1; pv.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
             content.addSubview(pv); preview = pv
-            button.frame = NSRect(x: (W - 460) / 2, y: H * 0.15, width: 460, height: 44); button.bezelStyle = .rounded; button.controlSize = .large
-            button.font = .systemFont(ofSize: 17, weight: .medium); button.target = target; button.action = action; content.addSubview(button)
+            button.frame = NSRect(x: (W - 460) / 2, y: top - 66 - ph - 28 - 44, width: 460, height: 44); button.bezelStyle = .rounded; button.controlSize = .large
+            button.font = .systemFont(ofSize: 17, weight: .medium); button.focusRingType = .none
+            button.target = target; button.action = action; content.addSubview(button)
         }
+        content.wantsLayer = true; content.layerUsesCoreImageFilters = true
+        for v in content.subviews { v.wantsLayer = true; v.layer?.opacity = 0 }
         shuffle(animated: false)
     }
-    /// New random stop positions, eased over 1 s (the original's 0.5 s timer + 1 s animation, slowed to stay calm on a big screen).
+    /// New random stop positions, eased over 1.2 s, so the colours drift around the edge.
     func shuffle(animated: Bool) {
         let stops = Liquid.palette.map { ($0.cgColor, Double.random(in: 0...1)) }.sorted { $0.1 < $1.1 }
         let colors = stops.map { $0.0 } + [stops[0].0], locs = stops.map { NSNumber(value: $0.1) } + [1]   // closes the circle with no seam
@@ -144,39 +161,66 @@ final class Liquid {
         for g in gradients { g.colors = colors; g.locations = locs }
         CATransaction.commit()
     }
-    /// A living squircle centred on the screen with half-size (a, b): superellipse (n = 5) plus three slow travelling waves along its rim.
-    func blob(_ a: CGFloat, _ b: CGFloat, amp: CGFloat, t: Double) -> CGPath {
-        let c = CGPoint(x: frontGlow.bounds.midX, y: frontGlow.bounds.midY), p = CGMutablePath(), n = 220, e = 2.0 / 5.0
-        for i in 0...n {
-            let th = Double(i) / Double(n) * 2 * .pi, ct = cos(th), st = sin(th)
+    /// A living superellipse centred on the screen with half-size (a, b) and exponent n, plus three slow travelling waves on its rim.
+    /// `reverse` walks it the other way so it cuts a hole in a rectangle under the non-zero rule (shadow paths have no even-odd).
+    func blob(_ a: CGFloat, _ b: CGFloat, n: Double, amp: CGFloat, t: Double, reverse: Bool = false, into p: CGMutablePath = CGMutablePath()) -> CGMutablePath {
+        let c = CGPoint(x: bloom.bounds.midX, y: bloom.bounds.midY), steps = 240, e = 2.0 / n
+        for i in 0...steps {
+            let th = Double(reverse ? steps - i : i) / Double(steps) * 2 * .pi, ct = cos(th), st = sin(th)
             let x = CGFloat(copysign(pow(abs(ct), e), ct)) * a, y = CGFloat(copysign(pow(abs(st), e), st)) * b
             let wave = 0.55 * sin(3 * th + 0.45 * t) + 0.30 * sin(5 * th - 0.70 * t + 1.3) + 0.15 * sin(9 * th + 1.10 * t + 2.1)
-            let len = max(1, hypot(x, y)), k = 1 + amp * CGFloat(wave) / len          // push the rim outward/inward along its radius
+            let len = max(1, hypot(x, y)), k = 1 + amp * CGFloat(wave) / len
             let pt = CGPoint(x: c.x + x * k, y: c.y + y * k)
             if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
         }
         p.closeSubpath(); return p
     }
+    /// Apple-style text transition: each element arrives from a blur, fades and settles a few points, one after another;
+    /// it leaves the same way, faster and in reverse order.
+    func reveal(_ on: Bool) {
+        guard on != shown else { return }; shown = on
+        let order: [NSView] = [title, why, preview, button.superview == nil ? nil : button, foot].compactMap { $0 }
+        let now = CACurrentMediaTime(), ease = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+        for (i, v) in (on ? order : order.reversed()).enumerated() {
+            guard let l = v.layer else { continue }
+            if l.filters == nil, let b = CIFilter(name: "CIGaussianBlur") { b.name = "blur"; b.setValue(0, forKey: kCIInputRadiusKey); l.filters = [b] }
+            let start = now + Double(i) * (on ? 0.08 : 0.025), dur = on ? 0.6 : 0.3
+            for (key, from, to) in [("opacity", on ? 0.0 : 1.0, on ? 1.0 : 0.0), ("filters.blur.inputRadius", on ? 16.0 : 0.0, on ? 0.0 : 10.0),
+                                    ("transform.translation.y", on ? -12.0 : 0.0, on ? 0.0 : -6.0)] {
+                let a = CABasicAnimation(keyPath: key); a.fromValue = from; a.toValue = to; a.beginTime = start; a.duration = dur
+                a.timingFunction = ease; a.fillMode = .both; a.isRemovedOnCompletion = false; l.add(a, forKey: key)
+            }
+            l.opacity = on ? 1 : 0
+        }
+    }
     func draw(level: Double, t: Double) {
         if t - lastShuffle > 0.9 { lastShuffle = t; shuffle(animated: true) }
-        let bw = frontGlow.bounds.width, bh = frontGlow.bounds.height
+        let bw = bloom.bounds.width, bh = bloom.bounds.height, short = min(bw, bh)
         let s = CGFloat(min(1, max(0, level))), ease = s * s * (3 - 2 * s), breathe = CGFloat(0.5 + 0.5 * sin(1.3 * t))
-        let d = ease * (min(bw, bh) / 2 + 60)                                               // how far the front has closed in
-        let a = bw / 2 + 50 - d, b = bh / 2 + 50 - d                                         // starts just past the screen edge
-        let front = a > 2 && b > 2 ? blob(a, b, amp: min(10 + 26 * ease, 0.1 * min(a, b) + 4), t: t) : nil
-        let outside = CGMutablePath(); outside.addRect(frontGlow.bounds); if let f = front { outside.addPath(f) }
-        let border = blob(bw / 2 + 22, bh / 2 + 22, amp: 20, t: t * 0.8 + 7)               // the locked-state halo on the screen edge
         let locked = CGFloat(min(1, max(0, (level - 0.88) / 0.12)))
+        let fade = min(1, 6 * s)                                                     // everything eases in from nothing and back out
+        let soft = 30 + 110 * ease                                                   // feather radius grows as the light moves in
+        let d = ease * (short / 2 + 1.15 * soft)                                     // how far the front has travelled; closes only at the end
+        let a = bw / 2 + soft - d, b = bh / 2 + soft - d
+        // region between the screen edge and the front, holed by the wavy front; empty hole once it has closed
+        let region = CGMutablePath(); region.addRect(bloom.bounds.insetBy(dx: -300, dy: -300))
+        let front: CGMutablePath? = a > 4 && b > 4 ? blob(a, b, n: 4, amp: min(14 + 30 * ease, 0.12 * min(a, b)), t: t) : nil
+        if front != nil { _ = blob(a, b, n: 4, amp: min(14 + 30 * ease, 0.12 * min(a, b)), t: t, reverse: true, into: region) }
+        let rim = blob(bw / 2, bh / 2, n: 14, amp: 4 + 8 * breathe * (0.4 + 0.6 * locked), t: t * 0.8 + 7)   // hugs the display edge
+        var shift = CGAffineTransform(translationX: Liquid.M, y: Liquid.M)
+        let rimPath = rim.copy(using: &shift), frontPath = front?.copy(using: &shift)
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        frostMask.path = outside; dimMask.path = outside
-        for (m, w, edge) in rings {
-            if edge { m.path = border; m.lineWidth = 2 * w * (0.9 + 0.45 * breathe) }
-            else { m.path = front; m.lineWidth = 2 * w * (0.75 + 0.35 * ease + 0.15 * breathe) }
+        for m in [frostFeather, bloomFeather] { m.shadowPath = region; m.shadowRadius = soft }
+        bloom.opacity = Float(fade * (0.25 + 0.35 * ease + 0.10 * locked * breathe)); blur.alphaValue = fade
+        for (m, w, isRim) in rings {
+            if isRim { m.path = rimPath; m.lineWidth = 2 * w * (0.7 + 0.45 * ease + 0.2 * locked * breathe) }
+            else { m.path = frontPath; m.lineWidth = 2 * w * (0.8 + 0.4 * ease) }
         }
-        frontGlow.opacity = Float(min(1, 0.35 + 3 * s) * (1 - locked))                     // a hint at first, hands over to the border glow
-        edgeGlow.opacity = Float(locked * (0.75 + 0.25 * breathe))
+        rimGlow.opacity = Float(fade * min(1, 0.6 + 2.5 * s) * (0.85 + 0.15 * breathe))
+        frontGlow.opacity = Float(0.45 * min(1, 4 * s) * (1 - locked))   // a faint luminous edge on the front, never a line
+        tint.opacity = Float(0.30 * locked)                                          // depth behind the message, not a grey dim
         CATransaction.commit()
-        content.alphaValue = CGFloat(min(1, max(0, (level - 0.9) / 0.1)))
+        reveal(level >= 0.93)
     }
 }
 

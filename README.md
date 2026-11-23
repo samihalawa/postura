@@ -56,8 +56,9 @@ than 22°, shoulders tilted more than 16°. The UI is in English, or Spanish whe
 
 `Postura.app` (Swift, AppKit, Core Animation) owns the camera, the timing and the screens. Two to six frames a second (more while it suspects bad posture)
 go to `postura-eye.py`, which runs MediaPipe Pose Landmarker and Face Landmarker and returns a score from 0 (good)
-to 1 (bad) with a reason. The app smooths the score, then drives the glow: a rotating conic gradient behind stroked,
-blurred masks that trace a slowly waving squircle.
+to 1 (bad) with a reason. The app smooths the score, then drives the glow: a rotating conic gradient shown through
+blurred strokes on the display edge, plus a colour wash and a frosted blur behind a slowly waving front. Every boundary is
+feathered with a GPU shadow mask, so there is no hard line anywhere. The message arrives with a staggered blur-in.
 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second). Offline replay of
 a recording: `~/Library/Application\ Support/Postura/venv/bin/python3 postura-eye.py --video clip.mov`.
