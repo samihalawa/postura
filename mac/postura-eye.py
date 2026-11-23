@@ -127,8 +127,10 @@ def judge(m):
     # glasses: dark lenses never count; otherwise the user's own glasses / no-glasses examples decide
     pg, gk = 0.0, ""
     if os.environ.get("POSTURA_GLASSES", "1") == "0": return p, why   # glasses not required (app setting)
-    if m.get("shade", 1) < 0.75: pg, gk = sig((0.55 - m["shade"]) / 0.04), "sunglasses"
     g = glasses(m)
+    # dark lenses read ~0.4; clear glasses against a bright window read ~0.55-0.65, so only clearly dark counts,
+    # and never when the eyes look like the user's own taught glasses
+    if m.get("shade", 1) < 0.55 and not (g is not None and g > 0.0): pg, gk = sig((0.45 - m["shade"]) / 0.03), "sunglasses"
     if g is not None:
         m["glasses"] = g; q = sig((-0.10 - g) / 0.03)   # only clearly "no glasses" counts
         if q > pg: pg, gk = q, "glasses"
@@ -155,7 +157,7 @@ def learn(t, m):
     if forward and t > forward[1]: forward = None
     usable = m["face"] and m["body"]
     if forward and usable: save(forward[0], t, m)
-    if m["face"]: recent.append((t, m))
+    if m["face"]: recent.append((t, dict(m)))   # a copy: the caller pops _emb from m after judging
     return forward[0] if forward else ""
 
 last_tele = 0
