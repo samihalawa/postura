@@ -2,31 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleDisplayName</key>
+	<string>Postura</string>
 	<key>CFBundleExecutable</key>
 	<string>Postura</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>io.github.samihalawa.postura</string>
 	<key>CFBundleName</key>
 	<string>Postura</string>
-	<key>CFBundleDisplayName</key>
-	<string>Postura</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
+	<string>1.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>110</string>
+	<string>111</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.healthcare-fitness</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSHumanReadableCopyright</key>
-	<string>MIT License · github.com/samihalawa/postura</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Postura watches your posture with the camera and covers the screen when you slouch. Everything is processed on this Mac; no images are saved.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License · github.com/samihalawa/postura</string>
 </dict>
 </plist>

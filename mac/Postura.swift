@@ -724,6 +724,7 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
             w.center(); window = w
         }
         NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(nil)   // no focus ring on a teach button: a stray space must not label anything
     }
 
     /// First launch: a private Python with MediaPipe, made with uv (Homebrew's, or uv's own installer into Application Support).
