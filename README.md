@@ -71,8 +71,12 @@ text arrives and leaves character by character (fade, rise, blur to sharp), and 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second). Offline replay of
 a recording: `~/Library/Application\ Support/Postura/venv/bin/python3 postura-eye.py --video clip.mov`.
 
-**Strict mode** (optional, for people who want it hard to switch off): build `build/Postura.app` and run
-`sudo ./mac/install.sh`. Root daemons relaunch the app and restore it if it is deleted or disabled.
+**Build from source**: `./build.sh` makes a universal `build/Postura.app` (ad-hoc signed; `SIGN_IDENTITY` and
+`NOTARY_*` variables give a Developer ID, notarized build; see the top of the script).
+
+**Strict mode** (optional, for people who want it hard to switch off): `BUNDLE_ID=com.sami.postura ./build.sh` then
+`sudo ./mac/install.sh`. Root daemons relaunch the app and restore it if it is deleted or disabled. With strict mode
+installed, opening the Homebrew copy simply brings up the strict copy's window.
 
 ## Compared with
 
