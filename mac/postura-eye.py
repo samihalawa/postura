@@ -126,6 +126,7 @@ def judge(m):
             if pm > 0.5 and p >= 0.5: why = W("examples")
     # glasses: dark lenses never count; otherwise the user's own glasses / no-glasses examples decide
     pg, gk = 0.0, ""
+    if os.environ.get("POSTURA_GLASSES", "1") == "0": return p, why   # glasses not required (app setting)
     if m.get("shade", 1) < 0.75: pg, gk = sig((0.55 - m["shade"]) / 0.04), "sunglasses"
     g = glasses(m)
     if g is not None:

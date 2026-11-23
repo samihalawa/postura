@@ -15,18 +15,23 @@ Everything runs on the Mac. No images are stored or sent anywhere; only numbers 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh
+brew install --cask samihalawa/tap/postura
 ```
 
-Needs macOS 14 or later and the Xcode Command Line Tools (`xcode-select --install`). The installer builds the app from
-source into `~/Applications/Postura.app`, downloads Google's MediaPipe models, sets up a private Python environment
-with [uv](https://github.com/astral-sh/uv), and adds a login item. Allow camera access when macOS asks.
+Or without Homebrew: `curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh`
 
-Check that it is running: a small verdict line sits in the bottom-left corner of the screen
-(`● good 12%`), and `~/Library/Logs/postura.log` gets one line per decision.
+Then open **Postura** once and allow the camera. It is a menu bar app (a standing figure in the menu bar), signed with a
+Developer ID and notarized by Apple, for macOS 14 or later on Apple silicon and Intel. On first launch it sets up its
+posture model, a private Python environment with Google's MediaPipe made by [uv](https://github.com/astral-sh/uv),
+in about a minute. It then keeps itself running: it starts at login and comes back if it is closed or crashes.
 
-Uninstall: `curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh -s uninstall`
-(add `--purge` to also delete your examples and logs).
+- **Menu bar**: current state at a glance, "This is good / bad posture", Settings.
+- **Window** (menu bar → Open Postura): live status and score, today's blocked time and corrections, teach buttons,
+  and options: require glasses, status pill, keep running, language.
+- **Log**: `~/Library/Logs/postura.log`, one line per decision.
+
+Uninstall: `brew uninstall --cask postura` (`--zap` also deletes your examples and logs), or
+`curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh -s uninstall`.
 
 ## How it behaves
 
@@ -39,7 +44,7 @@ Uninstall: `curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main
 | Lean out of view, hide your face or turn away while it is warning | It keeps counting as bad; it only clears when you are back and sitting well (or truly gone for 90 s). |
 | Wear sunglasses | They don't count as glasses: dark lenses are detected from the eye-to-cheek brightness. |
 | Are on a video call (FaceTime, Teams, WebRTC in the browser) | Only a faint edge glow, it never blocks. |
-| Disagree with it | Press **Ctrl-Opt-Cmd-G** (or the button on the cover): it lifts and learns that posture as good. 5 corrections a day. |
+| Disagree with it | Press **Ctrl-Opt-Cmd-G** (or the button on the cover, or the menu): it lifts and learns that posture as good. 5 corrections a day. |
 
 ## Teach it your posture
 
@@ -47,12 +52,12 @@ Uninstall: `curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main
 - The last 4 seconds and the next 6 seconds of measurements become examples in
   `~/Library/Application Support/Postura/examples.jsonl`. Near an example, your labels win over the built-in rules,
   newest first.
-- Same from a terminal: `postura-train bad|good`. Optional: `postura-train glasses|noglasses` teaches it to also
-  cover the screen when you forget your glasses.
+- Same from the menu bar or the window. With **Require glasses** on, the window's glasses buttons teach it what you
+  look like with and without them, and it covers the screen when you forget them (sunglasses never count).
 
 The built-in rules only flag clearly bad posture: head sunk towards the shoulders and pushed forward, head rolled more
 than 22°, shoulders tilted more than 16°. The UI is in English, or Spanish when that is the Mac's first language
-(`defaults write io.github.samihalawa.postura language es|en` to choose).
+(or pick one in the window).
 
 ## How it works
 

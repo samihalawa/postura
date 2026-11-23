@@ -3,12 +3,14 @@
 // is fixed. The judgement (p = 0..1 bad, why) comes from postura-eye.py; this app owns the camera, the timing and the screens.
 // Out of frame, far away, turned away, screen locked or on a call: never blocks. Everything runs on the Mac; no images are saved.
 import AppKit
+import SwiftUI
 import AVFoundation
 import Quartz
 import Carbon.HIToolbox
 
 let fm = FileManager.default
-let supportDir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Postura")
+let supportDir = ProcessInfo.processInfo.environment["POSTURA_HOME"].map { URL(fileURLWithPath: $0) }
+    ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Postura")
 let statusURL = supportDir.appendingPathComponent("status.json")
 let trainURL = supportDir.appendingPathComponent("train")
 let logURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/postura.log")
@@ -23,12 +25,13 @@ func log(_ s: String) {
 /// UI language: `defaults write <bundle id> language es|en`, else Spanish when the Mac's first language is Spanish, else English.
 let spanish = (UserDefaults.standard.string(forKey: "language") ?? Locale.preferredLanguages.first ?? "en").hasPrefix("es")
 func L(_ es: String, _ en: String) -> String { spanish ? es : en }
-/// The posture judge runs in a Python venv: $POSTURA_PYTHON, the per-user install, or the system-wide (strict) install.
-let pythonPath: String = {
+/// The posture judge runs in a Python venv: $POSTURA_PYTHON, the per-user one (created on first launch), or strict mode's.
+func pythonPath() -> String? {
     if let p = ProcessInfo.processInfo.environment["POSTURA_PYTHON"] { return p }
-    let user = supportDir.appendingPathComponent("venv/bin/python3").path
-    return fm.isExecutableFile(atPath: user) ? user : "/usr/local/libexec/postura/venv/bin/python3"
-}()
+    let strict = ProcessInfo.processInfo.environment["POSTURA_HOME"] == nil ? ["/usr/local/libexec/postura/venv/bin/python3"] : []
+    return ([supportDir.appendingPathComponent("venv/bin/python3").path] + strict).first { fm.isExecutableFile(atPath: $0) }
+}
+let prefs = UserDefaults.standard
 func f2(_ x: Double) -> String { String(format: "%.2f", x) }
 
 // p is smoothed over ~1.2 s. Bad for GRACE s starts the liquid; it takes FILL s to cover the screen; good drains it in DRAIN s.
@@ -39,10 +42,12 @@ final class Eye {
     var onSample: (([String: Any]) -> Void)?
     let root = Bundle.main.resourceURL!
     func start() {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: pythonPath)
+        guard let py = pythonPath() else { log("no python yet"); return }
+        let p = Process(); p.executableURL = URL(fileURLWithPath: py)
         p.arguments = [root.appendingPathComponent("postura-eye.py").path]
         p.environment = ["POSTURA_MODELS": root.appendingPathComponent("models").path, "GLOG_minloglevel": "2", "TF_CPP_MIN_LOG_LEVEL": "2",
-                         "HOME": NSHomeDirectory(), "POSTURA_LANG": spanish ? "es" : "en"]
+                         "HOME": NSHomeDirectory(), "POSTURA_LANG": spanish ? "es" : "en", "POSTURA_HOME": supportDir.path,
+                         "POSTURA_GLASSES": requireGlasses() ? "1" : "0"]
         let i = Pipe(), o = Pipe(); p.standardInput = i; p.standardOutput = o; p.standardError = FileHandle.nullDevice
         var buf = Data()
         o.fileHandleForReading.readabilityHandler = { h in
@@ -56,8 +61,10 @@ final class Eye {
             }
         }
         p.terminationHandler = { _ in log("eye exited, restarting"); DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.start() } }
-        try? p.run(); input = i.fileHandleForWriting; busy = false
+        try? p.run(); input = i.fileHandleForWriting; busy = false; proc = p
     }
+    var proc: Process?
+    func restart() { proc?.terminate() }   // the termination handler starts a fresh one with the current settings
     func send(_ pb: CVPixelBuffer) {
         guard !busy, let fh = input else { return }
         autoreleasepool {
@@ -336,7 +343,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { _ in log("camera runtime error"); self.restartCamera() }
         log("start")
         eye.onSample = { s in DispatchQueue.main.async { self.handle(s, Date()) } }
-        eye.start()
+        shell.start()
         AVCaptureDevice.requestAccess(for: .video) { ok in DispatchQueue.main.async { if ok { self.startCamera() } else { self.camera = false; log("camera denied") } } }
         Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { _ in self.animate() }
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in self.tick() }
@@ -347,6 +354,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             return nil
         }
     }
+    func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool { shell.show(); return false }
     func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply { poweringOff ? .terminateNow : .terminateCancel }
 
     // MARK: camera
@@ -520,7 +528,9 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             let x = CATransition(); x.type = .fade; x.duration = 0.35; x.timingFunction = Kinetic.ease; h.layer?.add(x, forKey: "swap")
             h.stringValue = text; h.textColor = color
         }
-        hud?.orderFrontRegardless()
+        if prefs.object(forKey: "showHUD") as? Bool ?? true { hud?.orderFrontRegardless() } else { hud?.orderOut(nil) }
+        shell.update(level: level, blocked: blocked, p: pBar, present: present || dodging, camera: camera, inCall: inCall,
+                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), secs: blockedSeconds, left: left)
         let st: [String: Any] = ["mode": blocked ? "blocked" : level > 0 ? "filling" : "off", "level": level, "reason": reason, "p": pBar, "present": present,
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "fixesLeft": left, "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL) }
@@ -536,8 +546,233 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     }
 }
 
+// MARK: - App shell: menu bar item, settings window, keep-alive login agent, single instance, first-run setup
+
+let agentLabel = "io.github.samihalawa.postura"
+let agentURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(agentLabel).plist")
+/// Strict mode (root daemons, see mac/install.sh) keeps the app alive itself; the per-user agent is then not used.
+let strictMode = fm.fileExists(atPath: "/Library/LaunchDaemons/com.sami.postura.plist")
+let underAgent = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == agentLabel
+func requireGlasses() -> Bool { prefs.object(forKey: "requireGlasses") as? Bool ?? fm.fileExists(atPath: supportDir.appendingPathComponent("glasses_yes.npy").path) }
+func keepRunning() -> Bool { prefs.object(forKey: "keepRunning") as? Bool ?? true }
+@discardableResult func sh(_ cmd: String) -> Int32 {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", cmd]
+    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+    try? p.run(); p.waitUntilExit(); return p.terminationStatus
+}
+let showNote = Notification.Name("io.github.samihalawa.postura.show")
+
+/// Everything the window and the menu show, refreshed twice a second by Guard.tick().
+final class Model: ObservableObject {
+    @Published var state = ""
+    @Published var detail = ""
+    @Published var symbol = "figure.stand"
+    @Published var tint = Color.green
+    @Published var p = 0.0
+    @Published var blocked = "0 s"
+    @Published var fixesLeft = FIXES_PER_DAY
+    @Published var setup = ""
+    @Published var glasses = requireGlasses()
+    @Published var hud = prefs.object(forKey: "showHUD") as? Bool ?? true
+    @Published var keep = keepRunning()
+    @Published var language = prefs.string(forKey: "language") ?? ""
+}
+
+struct SettingsView: View {
+    @ObservedObject var m: Model
+    let teach: (String) -> Void
+    var body: some View {
+        Form {
+            Section {
+                HStack(spacing: 14) {
+                    Image(systemName: m.symbol).font(.system(size: 26, weight: .medium)).foregroundStyle(m.tint)
+                        .frame(width: 44, height: 44).background(m.tint.opacity(0.15), in: Circle())
+                        .contentTransition(.symbolEffect(.replace))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(m.state).font(.title3.weight(.semibold)).contentTransition(.opacity)
+                        Text(m.detail).font(.callout).foregroundStyle(.secondary).lineLimit(2).contentTransition(.opacity)
+                    }
+                }
+                .padding(.vertical, 4).animation(.smooth, value: m.state).animation(.smooth, value: m.detail)
+                if m.setup.isEmpty {
+                    LabeledContent(L("Mala postura", "Bad posture score")) {
+                        HStack(spacing: 10) {
+                            ProgressView(value: m.p).progressViewStyle(.linear).tint(m.tint).frame(width: 150)
+                            Text("\(Int(m.p * 100))%").monospacedDigit().foregroundStyle(.secondary).frame(width: 38, alignment: .trailing)
+                        }.animation(.smooth, value: m.p)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ProgressView().progressViewStyle(.linear)
+                        Text(m.setup).font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Section(L("Hoy", "Today")) {
+                LabeledContent(L("Tiempo bloqueado", "Time blocked"), value: m.blocked)
+                LabeledContent(L("Correcciones disponibles", "Corrections left"), value: "\(m.fixesLeft) / \(FIXES_PER_DAY)")
+            }
+            Section {
+                HStack {
+                    Button { teach("good") } label: { Label(L("Buena postura", "Good posture"), systemImage: "hand.thumbsup") }
+                    Button { teach("bad") } label: { Label(L("Mala postura", "Bad posture"), systemImage: "hand.thumbsdown") }
+                }
+                if m.glasses {
+                    HStack {
+                        Button { teach("gafas") } label: { Label(L("Llevo gafas", "Wearing glasses"), systemImage: "eyeglasses") }
+                        Button { teach("singafas") } label: { Label(L("Sin gafas", "No glasses"), systemImage: "eye") }
+                    }
+                }
+            } header: { Text(L("Enseñar", "Teach")) } footer: {
+                Text(L("Marca lo que ves ahora; aprende de los próximos segundos. Atajos: ⌃⌥⌘G buena, ⌃⌥⌘B mala.",
+                       "Labels what the camera sees now and over the next few seconds. Shortcuts: ⌃⌥⌘G good, ⌃⌥⌘B bad."))
+            }
+            Section(L("Opciones", "Options")) {
+                Toggle(L("Exigir gafas", "Require glasses"), isOn: $m.glasses).onChange(of: m.glasses) { _, v in prefs.set(v, forKey: "requireGlasses"); g.eye.restart() }
+                Toggle(L("Mostrar estado en pantalla", "Show status pill"), isOn: $m.hud).onChange(of: m.hud) { _, v in prefs.set(v, forKey: "showHUD") }
+                if !strictMode {
+                    Toggle(L("Mantener Postura activa", "Keep Postura running"), isOn: $m.keep).onChange(of: m.keep) { _, v in shell.setKeepRunning(v) }
+                }
+                Picker(L("Idioma", "Language"), selection: $m.language) {
+                    Text(L("Sistema", "System")).tag(""); Text("English").tag("en"); Text("Español").tag("es")
+                }.onChange(of: m.language) { _, v in
+                    if v.isEmpty { prefs.removeObject(forKey: "language") } else { prefs.set(v, forKey: "language") }; shell.relaunch()
+                }
+            }
+            Section {
+                LabeledContent(L("Versión", "Version"), value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+                HStack {
+                    Link(destination: URL(string: "https://github.com/samihalawa/postura")!) { Label("GitHub", systemImage: "arrow.up.right.square") }
+                    Spacer()
+                    Button(L("Abrir registro", "Open Log")) { NSWorkspace.shared.open(logURL) }
+                }
+            } footer: { Text(L("Todo se procesa en este Mac. No se guarda ninguna imagen.", "Everything is processed on this Mac. No images are saved.")) }
+        }
+        .formStyle(.grouped).frame(width: 440).fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
+    let model = Model()
+    var item: NSStatusItem?, window: NSWindow?, header = NSMenuItem(), sub = NSMenuItem()
+
+    /// Runs before anything else. Returns false when this process should step aside for the copy that is already running.
+    func launch() -> Bool {
+        if ProcessInfo.processInfo.environment["POSTURA_DEV"] != nil { return true }   // a second copy for development
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSWorkspace.shared.runningApplications.filter { $0.processIdentifier != me &&
+            ($0.bundleIdentifier == agentLabel || $0.bundleIdentifier == "com.sami.postura") }
+        if !others.isEmpty { DistributedNotificationCenter.default().postNotificationName(showNote, object: nil, deliverImmediately: true); return false }
+        if !strictMode && !underAgent && keepRunning() && writeAgent() {      // opened by hand: let launchd own the process from now on
+            prefs.set(true, forKey: "showWindowOnce")
+            sh("launchctl bootout gui/\(getuid())/\(agentLabel); launchctl bootstrap gui/\(getuid()) '\(agentURL.path)'")
+            return false
+        }
+        return true
+    }
+    /// Writes the keep-alive login agent for this copy of the app; true when it had to be (re)written.
+    func writeAgent() -> Bool {
+        let exe = Bundle.main.executablePath ?? ""
+        if let d = NSDictionary(contentsOf: agentURL), (d["ProgramArguments"] as? [String])?.first == exe,
+           sh("launchctl print gui/\(getuid())/\(agentLabel)") == 0 { return false }
+        let plist: NSDictionary = ["Label": agentLabel, "ProgramArguments": [exe], "RunAtLoad": true, "KeepAlive": true,
+                                   "ThrottleInterval": 5, "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive",
+                                   "StandardErrorPath": fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/postura.out.log").path]
+        try? fm.createDirectory(at: agentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        return plist.write(to: agentURL, atomically: true)
+    }
+    func setKeepRunning(_ on: Bool) {
+        prefs.set(on, forKey: "keepRunning")
+        if on { _ = writeAgent(); log("keep running: on"); relaunch() }
+        else { log("keep running: off"); try? fm.removeItem(at: agentURL); sh("launchctl bootout gui/\(getuid())/\(agentLabel) &") }
+    }
+    /// Starts a fresh copy (new language, new agent); launchd or the next copy takes over.
+    func relaunch() {
+        let path = Bundle.main.bundlePath
+        if underAgent { exit(0) }
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", "sleep 1; open '\(path)'"]; try? p.run(); exit(0)
+    }
+
+    func start() {
+        DistributedNotificationCenter.default().addObserver(forName: showNote, object: nil, queue: .main) { _ in self.show() }
+        let it = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        it.button?.image = NSImage(systemSymbolName: "figure.stand", accessibilityDescription: "Postura")
+        let menu = NSMenu(); menu.delegate = self; header.isEnabled = false; sub.isEnabled = false
+        menu.addItem(header); menu.addItem(sub); menu.addItem(.separator())
+        func add(_ t: String, _ sym: String, _ a: Selector, _ key: String = "") {
+            let i = NSMenuItem(title: t, action: a, keyEquivalent: key); i.target = self; i.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil); menu.addItem(i)
+        }
+        add(L("Abrir Postura", "Open Postura"), "macwindow", #selector(show))
+        menu.addItem(.separator())
+        add(L("Esto es buena postura", "This Is Good Posture"), "hand.thumbsup", #selector(good))
+        add(L("Esto es mala postura", "This Is Bad Posture"), "hand.thumbsdown", #selector(bad))
+        menu.addItem(.separator())
+        add(L("Ajustes…", "Settings…"), "gearshape", #selector(show), ",")
+        add(L("Acerca de Postura", "About Postura"), "info.circle", #selector(about))
+        it.menu = menu; item = it
+        if pythonPath() == nil { setup() } else { g.eye.start() }
+        if prefs.bool(forKey: "showWindowOnce") || pythonPath() == nil { prefs.removeObject(forKey: "showWindowOnce"); DispatchQueue.main.async { self.show() } }
+    }
+    func menuNeedsUpdate(_ menu: NSMenu) { header.title = model.state; sub.title = model.detail }
+    @objc func good() { g.teach("good") }
+    @objc func bad() { g.teach("bad") }
+    @objc func about() { NSApp.activate(ignoringOtherApps: true); NSApp.orderFrontStandardAboutPanel(nil) }
+    @objc func show() {
+        if window == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(m: model) { g.teach($0) }))
+            w.title = "Postura"; w.styleMask = [.titled, .closable, .miniaturizable]; w.isReleasedWhenClosed = false; w.delegate = self
+            w.center(); window = w
+        }
+        NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// First launch: a private Python with MediaPipe, made with uv (Homebrew's, or uv's own installer into Application Support).
+    func setup() {
+        model.setup = L("Descargando (1–2 min, solo la primera vez)…", "Downloading (1–2 minutes, first launch only)…")
+        let sup = supportDir.path, out = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/postura-setup.log").path
+        let script = """
+        set -e; exec >>'\(out)' 2>&1; date
+        UV=$(for u in /opt/homebrew/bin/uv /usr/local/bin/uv "$HOME/.local/bin/uv" '\(sup)/bin/uv'; do [ -x "$u" ] && echo "$u" && break; done)
+        if [ -z "$UV" ]; then curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR='\(sup)/bin' UV_NO_MODIFY_PATH=1 sh; UV='\(sup)/bin/uv'; fi
+        "$UV" venv --python 3.11 '\(sup)/venv.tmp'
+        "$UV" pip install --python '\(sup)/venv.tmp/bin/python3' mediapipe opencv-python-headless numpy
+        rm -rf '\(sup)/venv'; mv '\(sup)/venv.tmp' '\(sup)/venv'
+        """
+        log("setup: creating the posture model environment")
+        DispatchQueue.global().async {
+            let ok = sh(script) == 0 && pythonPath() != nil
+            DispatchQueue.main.async {
+                if ok { log("setup: done"); self.model.setup = ""; g.eye.start() }
+                else { log("setup: failed, see postura-setup.log"); self.model.setup = L("Ha fallado. Se reintentará en 1 min. Detalles en postura-setup.log", "Failed. Retrying in a minute. Details in postura-setup.log")
+                       DispatchQueue.main.asyncAfter(deadline: .now() + 60) { self.setup() } }
+            }
+        }
+    }
+
+    /// Called by Guard.tick(): status for the menu bar icon, the menu and the window.
+    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, secs: Double, left: Int) {
+        let (st, d, sym, tint): (String, String, String, Color) = {
+            if !model.setup.isEmpty { return (L("Preparando…", "Setting up…"), L("Primera vez: instalando el modelo", "First launch: installing the model"), "arrow.down.circle", .blue) }
+            if !camera { return (L("Sin cámara", "No camera"), L("Permítela en Ajustes → Privacidad → Cámara", "Allow it in Settings → Privacy → Camera"), "video.slash", .orange) }
+            if blocked { return (L("Bloqueado", "Blocked"), reason, "figure.fall", .red) }
+            if level > 0 { return (L("Corrige la postura", "Fix your posture"), reason, "figure.fall", .orange) }
+            if inCall { return (L("En una llamada", "On a call"), L("Solo un aviso suave, nunca bloquea", "Only a gentle hint, never blocks"), "phone", .blue) }
+            if !present { return (L("No te veo", "Not watching"), L("Nadie delante de la cámara", "Nobody in front of the camera"), "eye.slash", .gray) }
+            if p >= RELEASE { return (L("Dudoso", "Unsure"), reason, "figure.stand", .yellow) }
+            return (L("Buena postura", "Good posture"), L("Vigilando", "Watching"), "figure.stand", .green)
+        }()
+        if model.state != st { model.state = st }; if model.detail != d { model.detail = d }
+        if model.symbol != sym { model.symbol = sym; item?.button?.image = NSImage(systemSymbolName: sym, accessibilityDescription: st) }
+        model.tint = tint; model.p = p; model.fixesLeft = left
+        model.blocked = secs < 60 ? "\(Int(secs)) s" : "\(Int(secs / 60)) min"
+        item?.button?.toolTip = "Postura · \(st)"
+    }
+}
+let shell = Shell()
+
 let app = NSApplication.shared
 let g = Guard()
+if !shell.launch() { exit(0) }
 app.delegate = g
 app.setActivationPolicy(.accessory)
 app.run()
