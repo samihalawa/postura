@@ -1,0 +1,7 @@
+#!/bin/bash
+# postura-train bad|good: the last 4 s and the next 6 s of posture measurements become examples.
+# gafas|singafas (glasses|noglasses): the last 4 s teach "with / without glasses". Same as the hotkeys Ctrl-Opt-Cmd-B / G.
+# Only numbers are stored, never images.
+case "$1" in bad|good|gafas|singafas) l=$1;; glasses) l=gafas;; noglasses) l=singafas;; *) echo "usage: postura-train bad|good|glasses|noglasses"; exit 1;; esac
+pgrep -x Postura >/dev/null || { echo "Postura is not running"; exit 1; }
+printf %s "$l" > "$HOME/Library/Application Support/Postura/train"; echo "Learning '$1': hold that posture for 6 s."

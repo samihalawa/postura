@@ -1,0 +1,14 @@
+#!/bin/bash
+# postura-keeper (root): puts postura back if its app, scripts or services are removed, changed or disabled.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+B=/var/db/postura; L=/usr/local/libexec/postura
+while :; do
+  for f in postura-guard postura-keeper postura-train; do cmp -s "$B/$f" "$L/$f" || install -m 755 -o root -g wheel "$B/$f" "$L/$f"; done
+  for f in MacOS/Postura Resources/postura-eye.py Info.plist _CodeSignature/CodeResources; do cmp -s "$B/Postura.app/Contents/$f" "$L/Postura.app/Contents/$f" || { rm -rf "$L/Postura.app"; cp -Rp "$B/Postura.app" "$L/"; pkill -x Postura; break; }; done
+  for s in com.sami.postura com.sami.postura-keeper; do
+    cmp -s "$B/$s.plist" "/Library/LaunchDaemons/$s.plist" || install -m 644 -o root -g wheel "$B/$s.plist" /Library/LaunchDaemons/
+    launchctl print-disabled system 2>/dev/null | grep -q "\"$s\" => disabled" && launchctl enable "system/$s"
+  done
+  launchctl print system/com.sami.postura >/dev/null 2>&1 || launchctl bootstrap system /Library/LaunchDaemons/com.sami.postura.plist 2>/dev/null
+  sleep 20
+done

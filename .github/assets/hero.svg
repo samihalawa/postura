@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#BC82F3"/><stop offset=".25" stop-color="#F5B9EA"/><stop offset=".45" stop-color="#8D9FFF"/>
+      <stop offset=".65" stop-color="#FF6778"/><stop offset=".85" stop-color="#FFBA71"/><stop offset="1" stop-color="#C686FF"/>
+    </linearGradient>
+    <filter id="b1" x="-20%" y="-40%" width="140%" height="180%"><feGaussianBlur stdDeviation="18"/></filter>
+    <filter id="b2" x="-20%" y="-40%" width="140%" height="180%"><feGaussianBlur stdDeviation="6"/></filter>
+  </defs>
+  <rect width="1200" height="360" fill="#0d1117"/>
+  <path id="blob" d="M150 70 C 400 40, 800 55, 1050 72 C 1110 80, 1135 130, 1130 180 C 1126 240, 1112 285, 1050 292 C 790 318, 420 305, 150 290 C 92 284, 66 236, 70 180 C 74 124, 92 76, 150 70 Z" fill="none"/>
+  <use href="#blob" stroke="url(#g)" stroke-width="44" filter="url(#b1)" opacity=".85"/>
+  <use href="#blob" stroke="url(#g)" stroke-width="14" filter="url(#b2)"/>
+  <use href="#blob" stroke="url(#g)" stroke-width="3"/>
+  <text x="600" y="178" text-anchor="middle" font-family="-apple-system, SF Pro Display, Helvetica, Arial, sans-serif" font-size="76" font-weight="700" fill="#f0f6fc">Postura</text>
+  <text x="600" y="228" text-anchor="middle" font-family="-apple-system, SF Pro Text, Helvetica, Arial, sans-serif" font-size="24" fill="#8b949e">Slouch, and a Siri-style glow closes in on your Mac. Sit up, and it opens back out.</text>
+</svg>

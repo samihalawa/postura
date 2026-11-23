@@ -1,0 +1,13 @@
+#!/bin/bash
+# postura-guard (root, strict mode): keeps Postura.app running in the guarded user's session and keeps the keeper alive.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+B=/var/db/postura; U=$(cat "$B/user"); ID=$(id -u "$U"); APP=/usr/local/libexec/postura/Postura.app
+asu(){ launchctl asuser "$ID" sudo -u "$U" "$@"; }
+while :; do
+  [ -f /Library/LaunchDaemons/com.sami.postura-keeper.plist ] || install -m 644 -o root -g wheel "$B/com.sami.postura-keeper.plist" /Library/LaunchDaemons/
+  launchctl print system/com.sami.postura-keeper >/dev/null 2>&1 || launchctl bootstrap system /Library/LaunchDaemons/com.sami.postura-keeper.plist 2>/dev/null
+  if [ "$(stat -f%Su /dev/console)" = "$U" ]; then
+    pgrep -x Postura >/dev/null || { echo "$(date '+%F %T') relaunch"; asu open -g "$APP"; }
+  fi
+  sleep 3
+done
