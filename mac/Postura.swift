@@ -119,7 +119,11 @@ final class Kinetic: NSView {
     func set(_ s: String) {
         guard s != text else { return }
         let old = glyphs, oldText = text; text = s
-        guard visible, !old.isEmpty else { old.forEach { $0.removeFromSuperlayer() }; glyphs = build(s); return }
+        guard visible else { old.forEach { $0.removeFromSuperlayer() }; glyphs = build(s); return }
+        if old.isEmpty {                                                       // first text while already showing: arrive normally
+            glyphs = build(s); let now = CACurrentMediaTime(), d = step(glyphs.count, 0.5)
+            for (i, g) in glyphs.enumerated() { run(g, into: true, at: now + d * Double(i)) }; return
+        }
         let fresh = build(s), now = CACurrentMediaTime()
         if oldText.count == s.count, oldText.count == old.count, fresh.count == old.count {   // same shape: only the changed characters move
             var k = 0
@@ -469,11 +473,16 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     // MARK: HUD and housekeeping, twice a second
     func showHUD() {  // small always-visible verdict, so you can see what it thinks without asking
         guard let f = NSScreen.main?.visibleFrame else { return }
-        let w = NSWindow(contentRect: NSRect(x: f.minX + 10, y: f.minY + 10, width: 430, height: 24), styleMask: .borderless, backing: .buffered, defer: false)
-        w.level = .statusBar; w.isOpaque = false; w.backgroundColor = NSColor.black.withAlphaComponent(0.55); w.ignoresMouseEvents = true
+        // a small frosted capsule, like a system HUD; its text crossfades instead of jumping
+        let w = NSWindow(contentRect: NSRect(x: f.minX + 10, y: f.minY + 10, width: 440, height: 26), styleMask: .borderless, backing: .buffered, defer: false)
+        w.level = .statusBar; w.isOpaque = false; w.backgroundColor = .clear; w.hasShadow = false; w.ignoresMouseEvents = true
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        let t = NSTextField(labelWithString: ""); t.frame = NSRect(x: 8, y: 3, width: 414, height: 18); t.font = .systemFont(ofSize: 12); w.contentView!.addSubview(t)
-        w.orderFrontRegardless(); hud = w; hudText = t
+        let v = NSVisualEffectView(frame: w.contentView!.bounds); v.material = .hudWindow; v.blendingMode = .behindWindow; v.state = .active
+        v.wantsLayer = true; v.layer?.cornerRadius = 13; v.layer?.masksToBounds = true; w.contentView = v
+        let t = NSTextField(labelWithString: ""); t.frame = NSRect(x: 12, y: 5, width: 420, height: 16); t.font = .systemFont(ofSize: 11.5, weight: .medium)
+        t.lineBreakMode = .byTruncatingTail; t.wantsLayer = true; v.addSubview(t)
+        w.alphaValue = 0; w.orderFrontRegardless(); hud = w; hudText = t
+        NSAnimationContext.runAnimationGroup { c in c.duration = 0.6; w.animator().alphaValue = 1 }
     }
     func tick() {
         let now = Date()
@@ -507,7 +516,11 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         else if pBar >= BLOCK { text = "● \(L("MAL", "BAD")) \(Int(pBar * 100))% · \(reason)"; color = .systemRed }
         else if pBar >= RELEASE { text = "● \(L("dudoso", "unsure")) \(Int(pBar * 100))% · \(reason)"; color = .systemYellow }
         else { text = "● \(L("bien", "good")) \(Int(pBar * 100))%   " + L("⌃⌥⌘B = esto es malo · ⌃⌥⌘G = esto es bueno", "⌃⌥⌘B = this is bad · ⌃⌥⌘G = this is good") }
-        hudText?.stringValue = text; hudText?.textColor = color; hud?.orderFrontRegardless()
+        if let h = hudText, h.stringValue != text || h.textColor != color {
+            let x = CATransition(); x.type = .fade; x.duration = 0.35; x.timingFunction = Kinetic.ease; h.layer?.add(x, forKey: "swap")
+            h.stringValue = text; h.textColor = color
+        }
+        hud?.orderFrontRegardless()
         let st: [String: Any] = ["mode": blocked ? "blocked" : level > 0 ? "filling" : "off", "level": level, "reason": reason, "p": pBar, "present": present,
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "fixesLeft": left, "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL) }
