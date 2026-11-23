@@ -32,7 +32,7 @@ let pythonPath: String = {
 func f2(_ x: Double) -> String { String(format: "%.2f", x) }
 
 // p is smoothed over ~1.2 s. Bad for GRACE s starts the liquid; it takes FILL s to cover the screen; good drains it in DRAIN s.
-let BLOCK = 0.65, RELEASE = 0.40, GRACE = 1.0, FILL = 3.5, DRAIN = 0.7, FIXES_PER_DAY = 5
+let BLOCK = 0.65, RELEASE = 0.40, GRACE = 1.0, FILL = 3.5, DRAIN = 1.0, FIXES_PER_DAY = 5, HOLD = 90.0
 
 final class Eye {
     var input: FileHandle?, busy = false
@@ -73,12 +73,73 @@ final class Eye {
 }
 
 class KeyWin: NSWindow { override var canBecomeKey: Bool { true } }
-func text(_ v: NSView, _ y: CGFloat, _ h: CGFloat, _ size: CGFloat, weight: NSFont.Weight = .regular, alpha: CGFloat = 1) -> NSTextField {
-    let t = NSTextField(labelWithString: "")
-    t.frame = NSRect(x: 0, y: y, width: v.frame.width, height: h); t.alignment = .center
-    t.font = .systemFont(ofSize: size, weight: weight); t.textColor = NSColor.white.withAlphaComponent(alpha)
-    t.shadow = { let s = NSShadow(); s.shadowBlurRadius = 14; s.shadowColor = NSColor.black.withAlphaComponent(0.22); return s }()   // lifts text off the glow, as on the lock screen
-    v.addSubview(t); return t
+/// One centred line of text whose characters arrive and leave one by one: each fades, rises 0.55 em and sharpens from a
+/// 0.14 em blur (MagicInterview's kinetic captions). A new string swaps only the characters that changed when the length
+/// is the same (the clock), otherwise the old line drifts out while the new one comes in.
+final class Kinetic: NSView {
+    let font: NSFont, color: NSColor
+    private(set) var text = "", visible = false
+    private var glyphs: [CALayer] = []
+    static let ease = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
+    init(_ parent: NSView, y: CGFloat, size: CGFloat, weight: NSFont.Weight, alpha: CGFloat = 1, digits: Bool = false) {
+        let f = NSFont.systemFont(ofSize: size, weight: weight)
+        font = digits ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight) : f; color = NSColor.white.withAlphaComponent(alpha)
+        super.init(frame: NSRect(x: 0, y: y, width: parent.bounds.width, height: ceil(size * 1.32)))
+        wantsLayer = true; layerUsesCoreImageFilters = true
+        layer?.shadowColor = NSColor.black.cgColor; layer?.shadowOpacity = 0.22; layer?.shadowRadius = 10; layer?.shadowOffset = .zero
+        parent.addSubview(self)
+    }
+    required init?(coder: NSCoder) { nil }
+    private func build(_ s: String) -> [CALayer] {
+        let a = NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color]), line = CTLineCreateWithAttributedString(a)
+        let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)), x0 = (bounds.width - width) / 2
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2, ns = s as NSString
+        var out: [CALayer] = [], i = 0
+        while i < ns.length {
+            let r = ns.rangeOfComposedCharacterSequence(at: i), ch = ns.substring(with: r)
+            let xa = CTLineGetOffsetForStringIndex(line, r.location, nil), xb = CTLineGetOffsetForStringIndex(line, r.location + r.length, nil)
+            let g = CATextLayer(); g.contentsScale = scale; g.string = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: color])
+            g.frame = CGRect(x: x0 + xa, y: 0, width: max(1, xb - xa) + font.pointSize * 0.25, height: bounds.height)
+            if let b = CIFilter(name: "CIGaussianBlur") { b.name = "blur"; b.setValue(0, forKey: kCIInputRadiusKey); g.filters = [b] }
+            g.opacity = 0; layer?.addSublayer(g); out.append(g); i += r.length
+        }
+        return out
+    }
+    private func run(_ g: CALayer, into on: Bool, at t: CFTimeInterval, remove: Bool = false) {
+        let em = font.pointSize, dur = on ? 0.62 : 0.34
+        for (k, a, b) in [("opacity", on ? 0 : 1, on ? 1 : 0), ("filters.blur.inputRadius", on ? 0.14 * em : 0, on ? 0 : 0.14 * em),
+                          ("transform.translation.y", on ? -0.55 * em : 0, on ? 0 : 0.22 * em)] as [(String, CGFloat, CGFloat)] {
+            let x = CABasicAnimation(keyPath: k); x.fromValue = a; x.toValue = b; x.beginTime = t; x.duration = dur
+            x.timingFunction = Kinetic.ease; x.fillMode = .both; x.isRemovedOnCompletion = false; g.add(x, forKey: k)
+        }
+        g.opacity = on ? 1 : 0
+        if remove { DispatchQueue.main.asyncAfter(deadline: .now() + (t - CACurrentMediaTime()) + dur + 0.05) { g.removeFromSuperlayer() } }
+    }
+    private func step(_ n: Int, _ spread: Double) -> Double { n > 1 ? min(0.028, spread / Double(n - 1)) : 0 }
+    func set(_ s: String) {
+        guard s != text else { return }
+        let old = glyphs, oldText = text; text = s
+        guard visible, !old.isEmpty else { old.forEach { $0.removeFromSuperlayer() }; glyphs = build(s); return }
+        let fresh = build(s), now = CACurrentMediaTime()
+        if oldText.count == s.count, oldText.count == old.count, fresh.count == old.count {   // same shape: only the changed characters move
+            var k = 0
+            for (i, (a, b)) in zip(oldText, s).enumerated() {
+                if a == b { fresh[i].removeAllAnimations(); fresh[i].opacity = 1; old[i].removeFromSuperlayer() }
+                else { run(old[i], into: false, at: now + 0.04 * Double(k), remove: true); run(fresh[i], into: true, at: now + 0.12 + 0.04 * Double(k)); k += 1 }
+            }
+        } else {
+            let a = step(old.count, 0.25), b = step(fresh.count, 0.5)
+            for (i, g) in old.enumerated() { run(g, into: false, at: now + a * Double(i), remove: true) }
+            for (i, g) in fresh.enumerated() { run(g, into: true, at: now + 0.2 + b * Double(i)) }
+        }
+        glyphs = fresh
+    }
+    func show(_ on: Bool, delay: Double = 0) {
+        guard on != visible else { return }; visible = on
+        if glyphs.isEmpty, on { glyphs = build(text) }
+        let now = CACurrentMediaTime() + delay, d = step(glyphs.count, on ? 0.5 : 0.2)
+        for (i, g) in (on ? glyphs : glyphs.reversed()).enumerated() { run(g, into: on, at: now + d * Double(i)) }
+    }
 }
 
 /// The warning, after the Apple Intelligence edge glow: light lives on the physical screen edge and floods inward as posture
@@ -90,7 +151,8 @@ final class Liquid {
     let win: KeyWin, blur = NSVisualEffectView(), tint = CALayer(), rimGlow = CALayer(), frontGlow = CALayer(), bloom = CALayer()
     let frostFeather = CAShapeLayer(), bloomFeather = CAShapeLayer()
     var rings: [(mask: CAShapeLayer, width: CGFloat, rim: Bool)] = [], gradients: [CAGradientLayer] = []
-    let content = NSView(), title: NSTextField, why: NSTextField, foot: NSTextField, button = NSButton()
+    let content = NSView(), title: Kinetic, why: Kinetic, foot: Kinetic, date: Kinetic, clock: Kinetic, button = NSButton()
+    let dayFmt = DateFormatter(), timeFmt = DateFormatter()
     var preview: NSView?, lastShuffle = -10.0, shown = false
     static let M: CGFloat = 180
     init(screen: NSScreen, session: AVCaptureSession, main: Bool, target: AnyObject, action: Selector) {
@@ -132,24 +194,35 @@ final class Liquid {
             }
         }
         content.frame = root.bounds; root.addSubview(content)
-        // one column stacked from the top, sized to the display so nothing overlaps on small screens
-        let ts = min(76, H * 0.085), top = H * 0.74, ph = min(315, H * 0.36), pw = ph * 4 / 3
-        title = text(content, top, ts * 1.3, ts, weight: .semibold); why = text(content, top - 42, 36, min(26, H * 0.032), weight: .medium, alpha: 0.9)
-        foot = text(content, H * 0.055, 24, 15, alpha: 0.7)
+        // one column stacked from the top like the lock screen (date, time, message, camera, action), sized to the display
+        var y = H * 0.955
+        func next(_ size: CGFloat, gap: CGFloat) -> CGFloat { y -= ceil(size * 1.32) + gap; return y }
+        let ds = min(19, H * 0.025), cs = min(64, H * 0.078), ts = min(68, H * 0.08), ws = min(24, H * 0.03)
+        date = Kinetic(content, y: next(ds, gap: 0), size: ds, weight: .semibold, alpha: 0.85)
+        clock = Kinetic(content, y: next(cs, gap: -4), size: cs, weight: .semibold, digits: true)
+        title = Kinetic(content, y: next(ts, gap: H * 0.035), size: ts, weight: .semibold)
+        why = Kinetic(content, y: next(ws, gap: 2), size: ws, weight: .medium, alpha: 0.9)
+        foot = Kinetic(content, y: H * 0.04, size: 14, weight: .regular, alpha: 0.7)
+        let ph = min(300, y - H * 0.04 - 44 - 26 - 30 - 22), pw = ph * 4 / 3, top = y - 22
+        dayFmt.locale = Locale(identifier: spanish ? "es_ES" : "en_US"); dayFmt.setLocalizedDateFormatFromTemplate("EEEEMMMMd")
+        timeFmt.locale = Locale.current; timeFmt.dateFormat = (DateFormatter.dateFormat(fromTemplate: "jmm", options: 0, locale: .current) ?? "H:mm")
+            .replacingOccurrences(of: "a", with: "").replacingOccurrences(of: "\u{202F}", with: "").trimmingCharacters(in: .whitespaces)
         gradients = grads; rings = rs
         if main {
-            let pv = NSView(frame: NSRect(x: (W - pw) / 2, y: top - 66 - ph, width: pw, height: ph)); pv.wantsLayer = true
+            let pv = NSView(frame: NSRect(x: (W - pw) / 2, y: top - ph, width: pw, height: ph)); pv.wantsLayer = true
             let pl = AVCaptureVideoPreviewLayer(session: session); pl.frame = pv.bounds; pl.videoGravity = .resizeAspectFill
             pl.connection?.automaticallyAdjustsVideoMirroring = false; pl.connection?.isVideoMirrored = true
-            pv.layer?.addSublayer(pl); pv.layer?.cornerRadius = 22; pv.layer?.masksToBounds = true
-            pv.layer?.borderWidth = 1; pv.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+            pv.layer?.addSublayer(pl)
+            let soft = CAShapeLayer(); soft.frame = pv.bounds; soft.fillColor = nil    // feathered edge: the mask is the soft shadow of an inset rounded rect
+            soft.shadowPath = CGPath(roundedRect: pv.bounds.insetBy(dx: 14, dy: 14), cornerWidth: 30, cornerHeight: 30, transform: nil)
+            soft.shadowColor = NSColor.black.cgColor; soft.shadowOpacity = 1; soft.shadowOffset = .zero; soft.shadowRadius = 9; pv.layer?.mask = soft
             content.addSubview(pv); preview = pv
-            button.frame = NSRect(x: (W - 460) / 2, y: top - 66 - ph - 28 - 44, width: 460, height: 44); button.bezelStyle = .rounded; button.controlSize = .large
+            button.frame = NSRect(x: (W - 460) / 2, y: top - ph - 26 - 44, width: 460, height: 44); button.bezelStyle = .rounded; button.controlSize = .large
             button.font = .systemFont(ofSize: 17, weight: .medium); button.focusRingType = .none
             button.target = target; button.action = action; content.addSubview(button)
         }
         content.wantsLayer = true; content.layerUsesCoreImageFilters = true
-        for v in content.subviews { v.wantsLayer = true; v.layer?.opacity = 0 }
+        for v in content.subviews where !(v is Kinetic) { v.wantsLayer = true; v.layer?.opacity = 0 }
         shuffle(animated: false)
     }
     /// New random stop positions, eased over 1.2 s, so the colours drift around the edge.
@@ -179,8 +252,10 @@ final class Liquid {
     /// it leaves the same way, faster and in reverse order.
     func reveal(_ on: Bool) {
         guard on != shown else { return }; shown = on
-        let order: [NSView] = [title, why, preview, button.superview == nil ? nil : button, foot].compactMap { $0 }
-        let now = CACurrentMediaTime(), ease = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+        let lines = [date, clock, title, why, foot]                                // text: character by character, top to bottom
+        for (i, k) in (on ? lines : lines.reversed()).enumerated() { k.show(on, delay: on ? [0, 0.08, 0.25, 0.45, 0.9][i] : 0.03 * Double(i)) }
+        let order: [NSView] = [preview, button.superview == nil ? nil : button].compactMap { $0 }
+        let now = CACurrentMediaTime() + (on ? 0.6 : 0), ease = Kinetic.ease
         for (i, v) in (on ? order : order.reversed()).enumerated() {
             guard let l = v.layer else { continue }
             if l.filters == nil, let b = CIFilter(name: "CIGaussianBlur") { b.name = "blur"; b.setValue(0, forKey: kCIInputRadiusKey); l.filters = [b] }
@@ -220,16 +295,29 @@ final class Liquid {
         frontGlow.opacity = Float(0.45 * min(1, 4 * s) * (1 - locked))   // a faint luminous edge on the front, never a line
         tint.opacity = Float(0.30 * locked)                                          // depth behind the message, not a grey dim
         CATransaction.commit()
+        let today = Date(); date.set(dayFmt.string(from: today)); clock.set(timeFmt.string(from: today))
         reveal(level >= 0.93)
+    }
+    /// The button's label changes with a quick blur through, never a jump.
+    func setButton(_ s: String, enabled: Bool) {
+        guard button.title != s || button.isEnabled != enabled else { return }
+        guard shown, let l = button.layer, !button.title.isEmpty else { button.title = s; button.isEnabled = enabled; return }
+        if l.filters == nil, let b = CIFilter(name: "CIGaussianBlur") { b.name = "blur"; b.setValue(0, forKey: kCIInputRadiusKey); l.filters = [b] }
+        let now = CACurrentMediaTime()
+        for (k, a, b) in [("opacity", 1.0, 0.0), ("filters.blur.inputRadius", 0.0, 8.0)] {
+            let x = CABasicAnimation(keyPath: k); x.fromValue = a; x.toValue = b; x.beginTime = now; x.duration = 0.18; x.autoreverses = true
+            x.timingFunction = Kinetic.ease; l.add(x, forKey: k + "swap")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { self.button.title = s; self.button.isEnabled = enabled }
     }
 }
 
 final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession(), queue = DispatchQueue(label: "postura.camera"), eye = Eye()
     var lastFrame = Date.distantPast, lastProcessed = Date.distantPast, lastSampleAt = Date.distantPast, lastSeen = Date.distantPast
-    var pBar = 0.0, badSince: Date?, graceUntil = Date.distantPast
+    var pBar = 0.0, badSince: Date?, graceUntil = Date.distantPast, lastFaceAt = Date.distantPast
     var level = 0.0, blocked = false, lastAnim = Date(), t0 = Date()
-    var present = false, training = "", reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
+    var present = false, dodging = false, training = "", reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
     var camera = true, inCall = false, locked = false, poweringOff = false
     var liquids: [Liquid] = [], hud: NSWindow?, hudText: NSTextField?, keyMonitor: Any?
     var blockedSeconds = 0.0
@@ -288,9 +376,18 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
         lastFrame = now; lastSampleAt = now; lastSample = s
         training = s["training"] as? String ?? ""
-        let seen = (s["face"] as? Bool) == true
-        if seen { lastSeen = now }
+        let seen = (s["face"] as? Bool) == true, person = (s["person"] as? Bool) == true
+        if seen || person { lastSeen = now }
         present = now.timeIntervalSince(lastSeen) < 2.5   // a missed frame or two is not "gone": hold the current state
+        // Once a warning is under way, leaning out of view, hiding the face or turning away never clears it: it keeps
+        // counting as bad until you come back and sit well, or are really gone for HOLD seconds.
+        let warning = level > 0 || pBar >= BLOCK, unjudged = (s["kind"] as? String) == "unjudged"
+        dodging = warning && (!seen || unjudged) && now.timeIntervalSince(lastFaceAt) < HOLD
+        if seen && !unjudged { lastFaceAt = now }
+        if dodging {
+            pBar += (1 - exp(-dt / 1.2)) * (1 - pBar); badSince = badSince ?? now; reasonKind = "hidden"
+            reason = L("no te veo", "can't see you"); return
+        }
         if !present { reset("nobody in frame"); return }
         if !training.isEmpty || now < graceUntil { pBar = 0; badSince = nil; return }
         if !seen { return }
@@ -305,8 +402,8 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     // MARK: liquid level 0..1, 30 times a second
     func animate() {
         let now = Date(), dt = min(0.2, now.timeIntervalSince(lastAnim)); lastAnim = now
-        let bad = present && !locked && pBar >= BLOCK && badSince != nil && now.timeIntervalSince(badSince!) >= GRACE && now >= graceUntil
-        let good = !present || locked || pBar < RELEASE || now < graceUntil
+        let bad = (present || dodging) && !locked && pBar >= BLOCK && badSince != nil && now.timeIntervalSince(badSince!) >= GRACE && now >= graceUntil
+        let good = (!present && !dodging) || locked || pBar < RELEASE || now < graceUntil
         let cap = inCall ? 0.22 : 1.0     // on a call only a thin edge glow shows, it never blocks
         if bad { level = min(cap, level + dt / FILL) } else if good { level = max(0, level - dt / DRAIN) }
         if level > cap { level = max(cap, level - dt / DRAIN) }
@@ -345,7 +442,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             let key = "fixes-" + String(stamp.string(from: now).prefix(10)), used = UserDefaults.standard.integer(forKey: key)
             if used >= FIXES_PER_DAY { flash(L("Sin más correcciones hoy", "No corrections left today") + " (\(FIXES_PER_DAY)/\(FIXES_PER_DAY))"); log("FIX refused: limit reached"); return }
             UserDefaults.standard.set(used + 1, forKey: key)
-            if reasonKind == "glasses" { label = "gafas" }      // "I do have my glasses on"
+            if reasonKind == "glasses" || reasonKind == "sunglasses" { label = "gafas" }      // "I do have my glasses on"
             log("FIX \(used + 1)/\(FIXES_PER_DAY) as \(label), was: \(reason) p=\(f2(pBar)) \(brief(lastSample))")
             graceUntil = now.addingTimeInterval(8); pBar = 0; badSince = nil
         } else { log("LABEL \(label) p=\(f2(pBar)) \(brief(lastSample))") }
@@ -384,16 +481,23 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         let stale = now.timeIntervalSince(lastFrame)
         if stale > 6 { present = false; reset("no frames") }
         if stale > 12, camera, !locked { restartCamera() }                       // lid was closed, camera taken away, etc.
-        let glasses = reasonKind == "glasses", left = fixesLeft()
+        let k = reasonKind, left = fixesLeft(), glasses = k == "glasses" || k == "sunglasses"
+        let cap = reason.prefix(1).uppercased() + reason.dropFirst()
+        let (head, line): (String, String) = {
+            switch k {
+            case "glasses": return (L("Ponte las gafas", "Put your glasses on"), L("Sin gafas · se quita en cuanto te las pongas", "No glasses · this clears as soon as you put them on"))
+            case "sunglasses": return (L("Ponte tus gafas", "Put your glasses on"), L("Las gafas de sol no cuentan · ponte las tuyas", "Sunglasses don't count · wear your own glasses"))
+            case "both": return (L("Siéntate bien y ponte las gafas", "Sit up and put your glasses on"), cap + L(" · se quita cuando arregles las dos cosas", " · clears when both are fixed"))
+            case "hidden": return (L("Vuelve frente a la cámara", "Come back in front of the camera"), L("Apartarte no lo quita · siéntate bien donde te vea", "Moving out of view doesn't clear it · sit up where I can see you"))
+            default: return (L("Siéntate bien", "Sit up straight"), cap + L(" · se quita en cuanto corrijas la postura", " · this clears as soon as you fix your posture"))
+            }
+        }()
         for l in liquids {
-            l.title.stringValue = glasses ? L("Ponte las gafas", "Put your glasses on") : L("Siéntate bien", "Sit up straight")
-            l.why.stringValue = glasses ? L("No llevas las gafas · se quita en cuanto te las pongas", "No glasses · this clears as soon as you put them on")
-                                        : "\(reason) · " + L("se quita en cuanto corrijas la postura", "this clears as soon as you fix your posture")
-            l.button.title = left > 0 ? (glasses ? L("Las llevo puestas — pulsa G o haz clic (quedan \(left) hoy)", "I'm wearing them — press G or click (\(left) left today)")
-                                                 : L("Estoy bien sentado — pulsa G o haz clic (quedan \(left) hoy)", "I'm sitting fine — press G or click (\(left) left today)"))
-                                      : L("Sin correcciones por hoy", "No corrections left today")
-            l.button.isEnabled = left > 0
-            l.foot.stringValue = L("Todo sigue funcionando por detrás.", "Everything keeps running in the background.")
+            l.title.set(head); l.why.set(line)
+            l.setButton(left > 0 ? (glasses ? L("Las llevo puestas — pulsa G o haz clic (quedan \(left) hoy)", "I'm wearing them — press G or click (\(left) left today)")
+                                            : L("Estoy bien sentado — pulsa G o haz clic (quedan \(left) hoy)", "I'm sitting fine — press G or click (\(left) left today)"))
+                                 : L("Sin correcciones por hoy", "No corrections left today"), enabled: left > 0)
+            l.foot.set(L("Todo sigue funcionando por detrás.", "Everything keeps running in the background."))
         }
         if blocked { NSApp.activate(ignoringOtherApps: true); liquids.forEach { $0.win.orderFrontRegardless() }; (liquids.first { $0.preview != nil } ?? liquids.first)?.win.makeKey() }
         var text = "", color = NSColor.systemGreen

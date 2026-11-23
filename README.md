@@ -35,7 +35,9 @@ Uninstall: `curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main
 | Sit well, or step away, or turn to a second screen | Nothing. Out of frame, further than 85 cm or turned more than 40° is never judged. |
 | Slouch, tilt your head or shoulders clearly | After about a second a thin glow appears at the screen edges and starts closing in. |
 | Keep slouching | The glow closes in over about 3.5 s, frosting the screen behind it, then covers it and blocks mouse, keyboard, Cmd-Tab and Force Quit. |
-| Sit up | The glow opens back out and disappears in under a second. |
+| Sit up | The glow opens back out and disappears in about a second. |
+| Lean out of view, hide your face or turn away while it is warning | It keeps counting as bad; it only clears when you are back and sitting well (or truly gone for 90 s). |
+| Wear sunglasses | They don't count as glasses: dark lenses are detected from the eye-to-cheek brightness. |
 | Are on a video call (FaceTime, Teams, WebRTC in the browser) | Only a faint edge glow, it never blocks. |
 | Disagree with it | Press **Ctrl-Opt-Cmd-G** (or the button on the cover): it lifts and learns that posture as good. 5 corrections a day. |
 
@@ -58,7 +60,8 @@ than 22°, shoulders tilted more than 16°. The UI is in English, or Spanish whe
 go to `postura-eye.py`, which runs MediaPipe Pose Landmarker and Face Landmarker and returns a score from 0 (good)
 to 1 (bad) with a reason. The app smooths the score, then drives the glow: a rotating conic gradient shown through
 blurred strokes on the display edge, plus a colour wash and a frosted blur behind a slowly waving front. Every boundary is
-feathered with a GPU shadow mask, so there is no hard line anywhere. The message arrives with a staggered blur-in.
+feathered with a GPU shadow mask, so there is no hard line anywhere. The lock screen shows the date and time; every line of
+text arrives and leaves character by character (fade, rise, blur to sharp), and a changed reason morphs in place.
 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second). Offline replay of
 a recording: `~/Library/Application\ Support/Postura/venv/bin/python3 postura-eye.py --video clip.mov`.

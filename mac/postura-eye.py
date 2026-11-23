@@ -15,7 +15,8 @@ OFFLINE = "--video" in sys.argv
 ES = os.environ.get("POSTURA_LANG", "en") == "es"
 TXT = {"far": ("lejos", "far away"), "side": ("de lado", "turned away"), "roll": ("cabeza muy inclinada", "head tilted"),
        "slouch": ("encorvado: cabeza hundida y adelantada", "slouching: head sunk and forward"), "shoulders": ("hombros torcidos", "shoulders tilted"),
-       "examples": ("como tus ejemplos de mala postura", "like your bad-posture examples"), "glasses": ("sin gafas: póntelas", "no glasses: put them on")}
+       "examples": ("como tus ejemplos de mala postura", "like your bad-posture examples"), "glasses": ("sin gafas", "no glasses"),
+       "sunglasses": ("gafas de sol", "sunglasses")}
 W = lambda k: TXT[k][0 if ES else 1]
 V = mp.tasks.vision
 RM = V.RunningMode.IMAGE if OFFLINE else V.RunningMode.VIDEO
@@ -32,14 +33,15 @@ def measure(rgb, ts):
     img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     pr = pose.detect(img) if OFFLINE else pose.detect_for_video(img, ts)
     fr = face.detect(img) if OFFLINE else face.detect_for_video(img, ts)
-    m = {"face": False, "body": False}
+    m = {"face": False, "body": False, "person": bool(pr.pose_landmarks)}
     if fr.face_landmarks:
         eyes = lambda l: math.hypot((l[263].x - l[33].x) * 640, (l[263].y - l[33].y) * 480)
         i = max(range(len(fr.face_landmarks)), key=lambda j: eyes(fr.face_landmarks[j]))  # nearest person = biggest face
         T = np.array(fr.facial_transformation_matrixes[i]); R = T[:3, :3]; lm = fr.face_landmarks[i]
         m["eyePx"] = eyes(lm); m["faces"] = len(fr.face_landmarks)
         if abs(math.degrees(math.asin(max(-1, min(1, -R[2][0]))))) < 30 and m["eyePx"] >= 60: m["_emb"] = eye_embedding(rgb, lm)
-        m.update(face=True, pitch=math.degrees(math.atan2(R[2][1], R[2][2])),      # + = face turned below the camera
+        if m["eyePx"] >= 40: m["shade"] = shade(rgb, lm)
+        m.update(face=True, person=True, pitch=math.degrees(math.atan2(R[2][1], R[2][2])),      # + = face turned below the camera
                  yaw=math.degrees(math.asin(max(-1, min(1, -R[2][0])))), roll=math.degrees(math.atan2(R[1][0], R[0][0])),
                  dist=-T[2][3], noseY=lm[1].y, noseX=lm[1].x)
     if m["face"] and pr.pose_landmarks:
@@ -57,6 +59,15 @@ def measure(rgb, ts):
                      shY=shY, shTilt=math.degrees(math.atan2(dy, abs(dx) + 1e-6)), sw2=sw2,
                      neck2=(shY - m["noseY"]) / sw2, lat=(m["noseX"] - (n[11].x + n[12].x) / 2) * 4 / 3 / sw2)
     return m
+
+def shade(rgb, lm):  # eye area brightness / cheek brightness: ~1 bare eyes or clear glasses, ~0.4 dark lenses
+    H, W = rgb.shape[:2]; P = lambda i: np.array([lm[i].x * W, lm[i].y * H]); r = []
+    def med(c, w, h):
+        x0, x1, y0, y1 = int(max(0, c[0] - w / 2)), int(min(W, c[0] + w / 2)), int(max(0, c[1] - h / 2)), int(min(H, c[1] + h / 2))
+        px = rgb[y0:y1, x0:x1].astype(np.float32); return float(np.median(px @ np.float32([0.299, 0.587, 0.114]))) if px.size else float("nan")
+    for a, b, cheek in ((33, 133, 50), (263, 362, 280)):
+        w = float(np.linalg.norm(P(a) - P(b))); r.append(med((P(a) + P(b)) / 2, w * 1.5, w * 0.9) / (med(P(cheek), w * 0.5, w * 0.5) + 1e-6))
+    return float(np.nanmean(r))
 
 def eye_embedding(rgb, lm):  # aligned eye-region crop -> image features (kept as numbers, the crop is discarded)
     import cv2
@@ -104,6 +115,7 @@ def load_mem():
     mem = (np.array([r[0] for r in rows]), np.array([r[1] for r in rows]), np.array([r[2] for r in rows], float)) if rows else None
 def judge(m):
     p, why = rules(m)
+    if why in (W("far"), W("side")): m["kind"] = "unjudged"
     if why in (W("far"), W("side")) or not m["face"]: return p, why
     load_mem()
     if mem is not None and all(k in m for k in KM):
@@ -112,10 +124,15 @@ def judge(m):
         if len(near):
             pm = float(y[near].mean()); p = (len(near) * pm + 2 * p) / (len(near) + 2)
             if pm > 0.5 and p >= 0.5: why = W("examples")
+    # glasses: dark lenses never count; otherwise the user's own glasses / no-glasses examples decide
+    pg, gk = 0.0, ""
+    if m.get("shade", 1) < 0.75: pg, gk = sig((0.55 - m["shade"]) / 0.04), "sunglasses"
     g = glasses(m)
     if g is not None:
-        m["glasses"] = g; pg = sig((-0.10 - g) / 0.03)   # only clearly "no glasses" counts
-        if pg > p: p, why = pg, W("glasses"); m["kind"] = "glasses"
+        m["glasses"] = g; q = sig((-0.10 - g) / 0.03)   # only clearly "no glasses" counts
+        if q > pg: pg, gk = q, "glasses"
+    if pg >= 0.5 and p >= 0.5: p, why, m["kind"] = max(p, pg), f"{why} · {W(gk)}", "both"
+    elif pg > p: p, why, m["kind"] = pg, W(gk), gk
     return p, why
 
 # ---- labelling: SUP/train holds "bad" or "good" -> the last 4 s and the next 6 s of measurements become examples ----
