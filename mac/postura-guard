@@ -9,7 +9,7 @@ while :; do
   launchctl print system/com.sami.postura-keeper >/dev/null 2>&1 || launchctl bootstrap system /Library/LaunchDaemons/com.sami.postura-keeper.plist 2>/dev/null
   if [ "$(stat -f%Su /dev/console)" = "$U" ]; then
     pgrep -x Postura >/dev/null || { echo "$(date '+%F %T') relaunch"; asu open -g "$APP"; n=0; }
-    # frozen (status is written twice a second): end it so the cover goes away; the next loop starts a fresh copy
+    # frozen (status is written every 2 s): end it so the cover goes away; the next loop starts a fresh copy
     m=$(stat -f%m "$ST" 2>/dev/null || date +%s)
     if [ $(( $(date +%s) - m )) -gt 30 ]; then n=$((n+1)); else n=0; fi
     [ $n -ge 6 ] && { echo "$(date '+%F %T') frozen, restarting"; pkill -9 -x Postura; n=0; }

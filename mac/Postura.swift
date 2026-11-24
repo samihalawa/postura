@@ -3,6 +3,8 @@
 // is fixed. The judgement (p = 0..1 bad, why) comes from postura-eye.py; this app owns the camera, the timing and the screens.
 // Out of frame, far away, turned away, screen locked or on a call: never blocks. Everything runs on the Mac; no images are saved.
 import AppKit
+import Metal
+import QuartzCore
 import SwiftUI
 import AVFoundation
 import Quartz
@@ -86,7 +88,7 @@ class KeyWin: NSWindow { override var canBecomeKey: Bool { true } }
 final class Kinetic: NSView {
     let font: NSFont, color: NSColor
     private(set) var text = "", visible = false
-    private var glyphs: [CALayer] = []
+    private var glyphs: [CALayer] = [], turn = 0
     static let ease = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
     init(_ parent: NSView, y: CGFloat, size: CGFloat, weight: NSFont.Weight, alpha: CGFloat = 1, digits: Bool = false) {
         let f = NSFont.systemFont(ofSize: size, weight: weight)
@@ -107,19 +109,26 @@ final class Kinetic: NSView {
             let xa = CTLineGetOffsetForStringIndex(line, r.location, nil), xb = CTLineGetOffsetForStringIndex(line, r.location + r.length, nil)
             let g = CATextLayer(); g.contentsScale = scale; g.string = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: color])
             g.frame = CGRect(x: x0 + xa, y: 0, width: max(1, xb - xa) + font.pointSize * 0.25, height: bounds.height)
-            if let b = CIFilter(name: "CIGaussianBlur") { b.name = "blur"; b.setValue(0, forKey: kCIInputRadiusKey); g.filters = [b] }
             g.opacity = 0; layer?.addSublayer(g); out.append(g); i += r.length
         }
         return out
     }
     private func run(_ g: CALayer, into on: Bool, at t: CFTimeInterval, remove: Bool = false) {
         let em = font.pointSize, dur = on ? 0.62 : 0.34
+        if let b = CIFilter(name: "CIGaussianBlur") { b.name = "blur"; b.setValue(0, forKey: kCIInputRadiusKey); g.filters = [b] }
+        layer?.shouldRasterize = false
         for (k, a, b) in [("opacity", on ? 0 : 1, on ? 1 : 0), ("filters.blur.inputRadius", on ? 0.14 * em : 0, on ? 0 : 0.14 * em),
                           ("transform.translation.y", on ? -0.55 * em : 0, on ? 0 : 0.22 * em)] as [(String, CGFloat, CGFloat)] {
             let x = CABasicAnimation(keyPath: k); x.fromValue = a; x.toValue = b; x.beginTime = t; x.duration = dur
             x.timingFunction = Kinetic.ease; x.fillMode = .both; x.isRemovedOnCompletion = false; g.add(x, forKey: k)
         }
         g.opacity = on ? 1 : 0
+        // a settled glyph keeps no filter or animation, and a settled line is cached as one bitmap: per-glyph blurs are slow to composite
+        turn += 1; let mine = turn; g.setValue(mine, forKey: "turn")
+        DispatchQueue.main.asyncAfter(deadline: .now() + (t - CACurrentMediaTime()) + dur + 0.05) { [weak self] in
+            if g.value(forKey: "turn") as? Int == mine { CATransaction.begin(); CATransaction.setDisableActions(true); g.removeAllAnimations(); g.filters = nil; CATransaction.commit() }
+            if let self, self.turn == mine { self.layer?.rasterizationScale = self.window?.backingScaleFactor ?? 2; self.layer?.shouldRasterize = true }
+        }
         if remove { DispatchQueue.main.asyncAfter(deadline: .now() + (t - CACurrentMediaTime()) + dur + 0.05) { g.removeFromSuperlayer() } }
     }
     private func step(_ n: Int, _ spread: Double) -> Double { n > 1 ? min(0.028, spread / Double(n - 1)) : 0 }
@@ -153,57 +162,129 @@ final class Kinetic: NSView {
     }
 }
 
+/// The light of the warning, drawn in one small Metal pass (1/6 of the points, 30 fps) and stretched. Everything in it is soft, so it
+/// looks the same as the former stack of full-resolution blurred layers, which cost the window server enough to slow the whole Mac.
+final class Glow {
+    struct Params {
+        var size = SIMD2<Float>(0, 0), pad = SIMD2<Float>(0, 0)
+        var front = SIMD4<Float>(0, 0, 0, 1)          // half-width, half-height, wave amplitude, feather
+        var rim = SIMD4<Float>(0, 1, 1, 0)            // wave amplitude, rim width factor, front width factor, time
+        var opacity = SIMD4<Float>(0, 0, 0, 0)        // tint, colour wash, rim, front
+        var stops: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = (.zero, .zero, .zero, .zero, .zero, .zero, .zero)
+    }
+    static let scale: CGFloat = 6
+    static let gpu: (dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState)? = {
+        guard let d = MTLCreateSystemDefaultDevice(), let q = d.makeCommandQueue(), let lib = try? d.makeLibrary(source: shader, options: nil) else { log("no Metal"); return nil }
+        let r = MTLRenderPipelineDescriptor(); r.vertexFunction = lib.makeFunction(name: "v"); r.fragmentFunction = lib.makeFunction(name: "f"); r.colorAttachments[0].pixelFormat = .rgba16Float
+        guard let p = try? d.makeRenderPipelineState(descriptor: r) else { log("no Metal pipeline"); return nil }
+        return (d, q, p)
+    }()
+    let layer = CAMetalLayer(), work = DispatchQueue(label: "postura.glow", qos: .userInteractive), lock = NSLock()
+    var inFlight = 0
+    init() {
+        layer.device = Glow.gpu?.dev; layer.pixelFormat = .rgba16Float; layer.isOpaque = false; layer.framebufferOnly = true
+        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB); layer.contentsGravity = .resize; layer.magnificationFilter = .linear
+    }
+    /// Never waits on the main thread: a frame is skipped when two are still on their way.
+    func render(_ p: Params) {
+        guard let gpu = Glow.gpu else { return }
+        lock.lock(); let busy = inFlight >= 2; if !busy { inFlight += 1 }; lock.unlock()
+        if busy { return }
+        work.async { [self] in
+            func done() { lock.lock(); inFlight -= 1; lock.unlock() }
+            guard let d = layer.nextDrawable(), let c = gpu.queue.makeCommandBuffer() else { done(); return }
+            Glow.encode(p, into: d.texture, c, gpu.pipe)
+            c.addCompletedHandler { _ in done() }
+            c.present(d); c.commit()
+        }
+    }
+    static func encode(_ p: Params, into t: MTLTexture, _ c: MTLCommandBuffer, _ pipe: MTLRenderPipelineState) {
+        let r = MTLRenderPassDescriptor(); r.colorAttachments[0].texture = t; r.colorAttachments[0].loadAction = .dontCare; r.colorAttachments[0].storeAction = .store
+        guard let e = c.makeRenderCommandEncoder(descriptor: r) else { return }
+        var q = p; e.setRenderPipelineState(pipe); e.setFragmentBytes(&q, length: MemoryLayout<Params>.stride, index: 0)
+        e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+    }
+    static func cdf(_ z: Float) -> Float { 1 / (1 + exp(-1.702 * min(20, max(-20, z)))) }
+    /// 0 inside the front, 1 outside it, feathered (the CPU twin of box() in the shader, for the frost mask).
+    static func region(_ q: SIMD2<Float>, _ p: Params) -> Float {
+        let u = q.x / p.front.x, v = q.y / p.front.y, g = min(1, sqrt(u * u + v * v)), th = atan2(v, u), s2 = sin(2 * th), t = p.rim.w
+        let wave = 0.55 * sin(3 * th + 0.45 * t) + 0.30 * sin(5 * th - 0.70 * t + 1.3) + 0.15 * sin(9 * th + 1.10 * t + 2.1)
+        let k = 1 - 0.06 * s2 * s2 * g * g, a = p.front.x * k + p.front.z * wave * g * g, b = p.front.y * k + p.front.z * wave * g * g, r = p.front.w
+        return 1 - (cdf((a - q.x) / r) - cdf((-a - q.x) / r)) * (cdf((b - q.y) / r) - cdf((-b - q.y) / r))
+    }
+    static let shader = """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct P { float2 size, pad; float4 front, rim, op; float4 st[7]; };
+    struct V { float4 pos [[position]]; float2 uv; };
+    vertex V v(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V o; o.pos = float4(q * 2 - 1, 0, 1); o.uv = q; return o; }
+    static float cdf(float z) { return 1 / (1 + exp(-1.702 * clamp(z, -20.0, 20.0))); }
+    // a filled rounded rectangle (half-size ab, corners drawn in by c) whose rim carries three slow travelling waves, grown by `grow`
+    // and blurred by r: the closed form of a Gaussian-blurred box, so it has no creases anywhere
+    static float box(float2 q, float2 ab, float c, float cp, float amp, float t, float grow, float r) {
+        float2 u = q / ab; float g = min(1.0, length(u)), th = atan2(u.y, u.x), s2 = sin(2 * th);
+        float wave = 0.55 * sin(3 * th + 0.45 * t) + 0.30 * sin(5 * th - 0.70 * t + 1.3) + 0.15 * sin(9 * th + 1.10 * t + 2.1);
+        float2 h = ab * (1 - c * pow(s2 * s2, cp) * g * g) + amp * wave * g * g + grow;
+        return max(0.0, cdf((h.x - q.x) / r) - cdf((-h.x - q.x) / r)) * max(0.0, cdf((h.y - q.y) / r) - cdf((-h.y - q.y) / r));
+    }
+    static float stroke(float2 q, float2 ab, float c, float cp, float amp, float t, float half_, float r) {
+        return clamp(box(q, ab, c, cp, amp, t, half_, r) - box(q, ab, c, cp, amp, t, -half_, r), 0.0, 1.0);
+    }
+    static float3 around(float a, constant P& p) {
+        a = fract(a); float3 c = p.st[0].rgb;
+        for (int i = 0; i < 6; i++) { float w = max(p.st[i + 1].w - p.st[i].w, 1e-4); c = mix(c, p.st[i + 1].rgb, clamp((a - p.st[i].w) / w, 0.0, 1.0)); }
+        return c;
+    }
+    fragment float4 f(V in [[stage_in]], constant P& p [[buffer(0)]]) {
+        float2 q = (in.uv - 0.5) * p.size; float t = p.rim.w, R = length(q);
+        float ang = atan2(q.x, q.y) / (2 * M_PI_F) + t / 14;
+        float3 light = around(ang, p), wash = 0;
+        float blur = min(0.35, 70 / (6.2832 * max(R, 1.0)));                          // the wash is blurred by 70 pt: wider in angle near the centre
+        for (int i = -4; i <= 4; i++) wash += around(ang + blur * i * 0.45, p) * exp(-0.1 * float(i * i));
+        float ws = 0; for (int i = -4; i <= 4; i++) ws += exp(-0.1 * float(i * i));
+        wash /= ws;
+        float3 mean = 0; for (int i = 0; i < 6; i++) mean += p.st[i].rgb / 6;
+        wash = mix(mean, wash, smoothstep(0.0, 320.0, R));
+        float region = 1, front = 0;
+        if (p.front.x > 4 && p.front.y > 4) {
+            region = 1 - box(q, p.front.xy, 0.06, 1, p.front.z, t, 0, p.front.w);
+            front = stroke(q, p.front.xy, 0.06, 1, p.front.z, t, 10 * p.rim.z, 36) * p.op.w;
+        }
+        float2 e = p.size / 2; float k = p.rim.y, ra = p.rim.x, rt = t * 0.8 + 7, keep = 1;
+        keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 4 * k, 2); keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 10 * k, 6);
+        keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 22 * k, 18); keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 44 * k, 52);
+        float rim = (1 - keep) * p.op.z;
+        float4 o = float4(float3(0.12, 0.08, 0.22), 1) * p.op.x;                       // premultiplied, back to front
+        float w = p.op.y * region; o = float4(wash, 1) * w + o * (1 - w);
+        o = float4(light, 1) * rim + o * (1 - rim);
+        o = float4(light, 1) * front + o * (1 - front);
+        return o;
+    }
+    """
+}
+
 /// The warning, after the Apple Intelligence edge glow: light lives on the physical screen edge and floods inward as posture
 /// stays bad, with every boundary feathered (no hard line anywhere). Blur and colour follow one soft, slowly waving front;
 /// correcting posture pulls it back to the edge. Locked: the whole screen is frosted and tinted, the rim breathes.
 final class Liquid {
-    static let palette: [NSColor] = ["BC82F3", "F5B9EA", "8D9FFF", "FF6778", "FFBA71", "C686FF"].map { h in
-        let v = Int(h, radix: 16)!; return NSColor(srgbRed: CGFloat(v >> 16 & 255) / 255, green: CGFloat(v >> 8 & 255) / 255, blue: CGFloat(v & 255) / 255, alpha: 1) }
-    let win: KeyWin, blur = NSVisualEffectView(), tint = CALayer(), rimGlow = CALayer(), frontGlow = CALayer(), bloom = CALayer()
-    let frostFeather = CAShapeLayer(), bloomFeather = CAShapeLayer()
-    var rings: [(mask: CAShapeLayer, width: CGFloat, rim: Bool)] = [], gradients: [CAGradientLayer] = []
+    static let palette: [SIMD4<Float>] = ["BC82F3", "F5B9EA", "8D9FFF", "FF6778", "FFBA71", "C686FF"].map { h in
+        let v = Int(h, radix: 16)!; return SIMD4(Float(v >> 16 & 255) / 255, Float(v >> 8 & 255) / 255, Float(v & 255) / 255, 1) }
+    let win: KeyWin, blur = NSVisualEffectView(), glow = Glow(), frost = CALayer()
     let content = NSView(), title: Kinetic, why: Kinetic, foot: Kinetic, date: Kinetic, clock: Kinetic, button = NSButton()
     let dayFmt = DateFormatter(), timeFmt = DateFormatter()
-    var preview: NSView?, lastShuffle = -10.0, shown = false
-    static let M: CGFloat = 180
-    init(screen: NSScreen, session: AVCaptureSession, main: Bool, target: AnyObject, action: Selector) {
-        let f = screen.frame, W = f.width, H = f.height
+    var preview: NSView?, camera: CALayer?, lastShuffle = -10.0, shown = false, lastClock = -10.0
+    var from: [SIMD4<Float>] = [], to: [SIMD4<Float>] = [], size = CGSize.zero, frostOpen = true
+    init(frame f: NSRect, main: Bool, target: AnyObject, action: Selector) {
+        let W = f.width, H = f.height; size = f.size
         win = KeyWin(contentRect: f, styleMask: .borderless, backing: .buffered, defer: false)
         win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel())); win.isOpaque = false; win.backgroundColor = .clear; win.hasShadow = false
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]; win.ignoresMouseEvents = true
         win.appearance = NSAppearance(named: .darkAqua)
         let root = win.contentView!; root.wantsLayer = true
         blur.appearance = NSAppearance(named: .aqua); blur.material = .fullScreenUI; blur.blendingMode = .behindWindow; blur.state = .active; blur.frame = root.bounds; root.addSubview(blur)
-        blur.wantsLayer = true; frostFeather.frame = root.bounds; blur.layer?.mask = frostFeather
-        for m in [frostFeather, bloomFeather] { m.fillColor = nil; m.shadowColor = NSColor.black.cgColor; m.shadowOpacity = 1; m.shadowOffset = .zero }
-        let host = NSView(frame: root.bounds); host.wantsLayer = true; host.layerUsesCoreImageFilters = true; root.addSubview(host)
-        tint.frame = host.bounds; tint.backgroundColor = NSColor(srgbRed: 0.12, green: 0.08, blue: 0.22, alpha: 1).cgColor; tint.opacity = 0; host.layer?.addSublayer(tint)
-        let side = hypot(W, H) + 80
-        let spin = CABasicAnimation(keyPath: "transform.rotation.z"); spin.fromValue = 0; spin.toValue = -2 * Double.pi; spin.duration = 14; spin.repeatCount = .infinity
-        var grads: [CAGradientLayer] = [], rs: [(mask: CAShapeLayer, width: CGFloat, rim: Bool)] = []
-        func conic(_ into: CALayer, _ o: CGFloat = 0) {
-            let g = CAGradientLayer(); g.type = .conic; g.startPoint = CGPoint(x: 0.5, y: 0.5); g.endPoint = CGPoint(x: 0.5, y: 0)
-            g.bounds = CGRect(x: 0, y: 0, width: side, height: side); g.position = CGPoint(x: W / 2 + o, y: H / 2 + o); g.add(spin, forKey: "spin")
-            into.addSublayer(g); grads.append(g)
-        }
-        func blurred(_ l: CALayer, _ r: CGFloat) { if let b = CIFilter(name: "CIGaussianBlur") { b.setValue(r, forKey: kCIInputRadiusKey); l.filters = [b] } }
-        // colour wash: the gradient itself, heavily blurred, shown through the same feathered region as the frost
-        bloom.frame = host.bounds; host.layer?.addSublayer(bloom)
-        let wash = CALayer(); wash.frame = host.bounds; blurred(wash, 70); conic(wash); bloom.addSublayer(wash)
-        bloomFeather.frame = host.bounds; bloom.mask = bloomFeather
-        // light: a bright rim hugging the display edge and a soft luminous wave on the front, each built from blurred strokes
-        // stroke layers reach M past the screen so the blur near the edge samples light, not emptiness
-        for (group, rim, layers) in [(rimGlow, true, [(CGFloat(4), CGFloat(2)), (10, 6), (22, 18), (44, 52)]),
-                                     (frontGlow, false, [(CGFloat(10), CGFloat(36))])] {
-            group.frame = host.bounds; host.layer?.addSublayer(group)
-            for (w, r) in layers {
-                let ring = CALayer(); ring.frame = host.bounds.insetBy(dx: -Liquid.M, dy: -Liquid.M); blurred(ring, r)
-                let clip = CALayer(); clip.frame = ring.bounds
-                let m = CAShapeLayer(); m.frame = ring.bounds; m.fillColor = nil; m.strokeColor = NSColor.white.cgColor; m.lineJoin = .round
-                clip.mask = m; conic(clip, Liquid.M); ring.addSublayer(clip); group.addSublayer(ring)
-                rs.append((m, w, rim))
-            }
-        }
+        blur.wantsLayer = true; frost.frame = root.bounds; frost.contentsGravity = .resize; blur.layer?.mask = frost
+        let host = NSView(frame: root.bounds); host.wantsLayer = true; root.addSubview(host)
+        glow.layer.frame = host.bounds; glow.layer.drawableSize = CGSize(width: ceil(W / Glow.scale), height: ceil(H / Glow.scale)); host.layer?.addSublayer(glow.layer)
         content.frame = root.bounds; root.addSubview(content)
         // one column stacked from the top like the lock screen (date, time, message, camera, action), sized to the display
         var y = H * 0.955
@@ -218,15 +299,15 @@ final class Liquid {
         dayFmt.locale = Locale(identifier: spanish ? "es_ES" : "en_US"); dayFmt.setLocalizedDateFormatFromTemplate("EEEEMMMMd")
         timeFmt.locale = Locale.current; timeFmt.dateFormat = (DateFormatter.dateFormat(fromTemplate: "jmm", options: 0, locale: .current) ?? "H:mm")
             .replacingOccurrences(of: "a", with: "").replacingOccurrences(of: "\u{202F}", with: "").trimmingCharacters(in: .whitespaces)
-        gradients = grads; rings = rs
         if main {
             let pv = NSView(frame: NSRect(x: (W - pw) / 2, y: top - ph, width: pw, height: ph)); pv.wantsLayer = true
-            let pl = AVCaptureVideoPreviewLayer(session: session); pl.frame = pv.bounds; pl.videoGravity = .resizeAspectFill
-            pl.connection?.automaticallyAdjustsVideoMirroring = false; pl.connection?.isVideoMirrored = true
-            pv.layer?.addSublayer(pl)
+            // fed from the frames already being analysed: a preview layer would rebuild the camera graph on the main thread every time
+            let pl = CALayer(); pl.frame = pv.bounds; pl.contentsGravity = .resizeAspectFill; pl.masksToBounds = true
+            pl.transform = CATransform3DMakeScale(-1, 1, 1); pl.actions = ["contents": NSNull()]
+            pv.layer?.addSublayer(pl); camera = pl
             let soft = CAShapeLayer(); soft.frame = pv.bounds; soft.fillColor = nil    // feathered edge: the mask is the soft shadow of an inset rounded rect
             soft.shadowPath = CGPath(roundedRect: pv.bounds.insetBy(dx: 14, dy: 14), cornerWidth: 30, cornerHeight: 30, transform: nil)
-            soft.shadowColor = NSColor.black.cgColor; soft.shadowOpacity = 1; soft.shadowOffset = .zero; soft.shadowRadius = 9; pv.layer?.mask = soft
+            soft.shadowColor = NSColor.black.cgColor; soft.shadowOpacity = 1; soft.shadowOffset = .zero; soft.shadowRadius = 9; soft.shouldRasterize = true; pv.layer?.mask = soft
             content.addSubview(pv); preview = pv
             button.frame = NSRect(x: (W - 460) / 2, y: top - ph - 26 - 44, width: 460, height: 44); button.bezelStyle = .rounded; button.controlSize = .large
             button.font = .systemFont(ofSize: 17, weight: .medium); button.focusRingType = .none
@@ -234,30 +315,35 @@ final class Liquid {
         }
         content.wantsLayer = true; content.layerUsesCoreImageFilters = true
         for v in content.subviews where !(v is Kinetic) { v.wantsLayer = true; v.layer?.opacity = 0 }
-        shuffle(animated: false)
+        shuffle(0); from = to
     }
-    /// New random stop positions, eased over 1.2 s, so the colours drift around the edge.
-    func shuffle(animated: Bool) {
-        let stops = Liquid.palette.map { ($0.cgColor, Double.random(in: 0...1)) }.sorted { $0.1 < $1.1 }
-        let colors = stops.map { $0.0 } + [stops[0].0], locs = stops.map { NSNumber(value: $0.1) } + [1]   // closes the circle with no seam
-        CATransaction.begin(); CATransaction.setAnimationDuration(animated ? 1.2 : 0)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut)); CATransaction.setDisableActions(!animated)
-        for g in gradients { g.colors = colors; g.locations = locs }
-        CATransaction.commit()
+    /// New random stop positions, eased over 1.2 s, so the colours drift around the edge. A stop is rgb + its place on the circle.
+    func shuffle(_ t: Double) {
+        from = stops(t); lastShuffle = t
+        var c = Liquid.palette.map { SIMD4($0.x, $0.y, $0.z, Float.random(in: 0...1)) }.sorted { $0.w < $1.w }
+        var last = c[0]; last.w = 1; c.append(last); c[0].w = 0; to = c                // closes the circle with no seam
     }
-    /// A living superellipse centred on the screen with half-size (a, b) and exponent n, plus three slow travelling waves on its rim.
-    /// `reverse` walks it the other way so it cuts a hole in a rectangle under the non-zero rule (shadow paths have no even-odd).
-    func blob(_ a: CGFloat, _ b: CGFloat, n: Double, amp: CGFloat, t: Double, reverse: Bool = false, into p: CGMutablePath = CGMutablePath()) -> CGMutablePath {
-        let c = CGPoint(x: bloom.bounds.midX, y: bloom.bounds.midY), steps = 240, e = 2.0 / n
-        for i in 0...steps {
-            let th = Double(reverse ? steps - i : i) / Double(steps) * 2 * .pi, ct = cos(th), st = sin(th)
-            let x = CGFloat(copysign(pow(abs(ct), e), ct)) * a, y = CGFloat(copysign(pow(abs(st), e), st)) * b
-            let wave = 0.55 * sin(3 * th + 0.45 * t) + 0.30 * sin(5 * th - 0.70 * t + 1.3) + 0.15 * sin(9 * th + 1.10 * t + 2.1)
-            let len = max(1, hypot(x, y)), k = 1 + amp * CGFloat(wave) / len
-            let pt = CGPoint(x: c.x + x * k, y: c.y + y * k)
-            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
-        }
-        p.closeSubpath(); return p
+    func stops(_ t: Double) -> [SIMD4<Float>] {
+        guard from.count == to.count, !to.isEmpty else { return to }
+        let x = Float(min(1, max(0, (t - lastShuffle) / 1.2))), e = x * x * (3 - 2 * x)
+        return zip(from, to).map { $0 + ($1 - $0) * e }
+    }
+    /// The frost mask: the same front as the glow, computed small (1/16) and stretched; dropped once the front has closed.
+    func drawFrost(_ p: Glow.Params) {
+        if p.front.x <= 4 || p.front.y <= 4 { if frostOpen { frostOpen = false; blur.layer?.mask = nil }; return }
+        if !frostOpen { frostOpen = true; blur.layer?.mask = frost }
+        let w = Int(size.width / 16), h = Int(size.height / 16)
+        guard w > 0, h > 0 else { return }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        for j in 0..<h { for i in 0..<w {
+            let q = SIMD2(Float((CGFloat(i) + 0.5) * size.width / CGFloat(w) - size.width / 2), Float(size.height / 2 - (CGFloat(j) + 0.5) * size.height / CGFloat(h)))
+            let v = UInt8(255 * min(1, max(0, Glow.region(q, p)))), k = (j * w + i) * 4
+            px[k] = v; px[k + 1] = v; px[k + 2] = v; px[k + 3] = v
+        } }
+        guard let d = CGDataProvider(data: Data(px) as CFData),
+              let m = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: d, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else { return }
+        frost.contents = m
     }
     /// Apple-style text transition: each element arrives from a blur, fades and settles a few points, one after another;
     /// it leaves the same way, faster and in reverse order.
@@ -276,37 +362,34 @@ final class Liquid {
                 let a = CABasicAnimation(keyPath: key); a.fromValue = from; a.toValue = to; a.beginTime = start; a.duration = dur
                 a.timingFunction = ease; a.fillMode = .both; a.isRemovedOnCompletion = false; l.add(a, forKey: key)
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + (start - CACurrentMediaTime()) + dur + 0.05) { [weak self] in
+                if self?.shown == on { l.removeAllAnimations(); l.filters = nil }
+            }
             l.opacity = on ? 1 : 0
         }
     }
     func draw(level: Double, t: Double) {
-        if t - lastShuffle > 0.9 { lastShuffle = t; shuffle(animated: true) }
-        let bw = bloom.bounds.width, bh = bloom.bounds.height, short = min(bw, bh)
+        if t - lastShuffle > 1.2 { shuffle(t) }
+        let bw = size.width, bh = size.height, short = min(bw, bh)
         let s = CGFloat(min(1, max(0, level))), ease = s * s * (3 - 2 * s), breathe = CGFloat(0.5 + 0.5 * sin(1.3 * t))
         let locked = CGFloat(min(1, max(0, (level - 0.88) / 0.12)))
         let fade = min(1, 6 * s)                                                     // everything eases in from nothing and back out
         let soft = 30 + 110 * ease                                                   // feather radius grows as the light moves in
         let d = ease * (short / 2 + 1.15 * soft)                                     // how far the front has travelled; closes only at the end
         let a = bw / 2 + soft - d, b = bh / 2 + soft - d
-        // region between the screen edge and the front, holed by the wavy front; empty hole once it has closed
-        let region = CGMutablePath(); region.addRect(bloom.bounds.insetBy(dx: -300, dy: -300))
-        let front: CGMutablePath? = a > 4 && b > 4 ? blob(a, b, n: 4, amp: min(14 + 30 * ease, 0.12 * min(a, b)), t: t) : nil
-        if front != nil { _ = blob(a, b, n: 4, amp: min(14 + 30 * ease, 0.12 * min(a, b)), t: t, reverse: true, into: region) }
-        let rim = blob(bw / 2, bh / 2, n: 14, amp: 4 + 8 * breathe * (0.4 + 0.6 * locked), t: t * 0.8 + 7)   // hugs the display edge
-        var shift = CGAffineTransform(translationX: Liquid.M, y: Liquid.M)
-        let rimPath = rim.copy(using: &shift), frontPath = front?.copy(using: &shift)
+        var p = Glow.Params()
+        p.size = SIMD2(Float(bw), Float(bh)); p.front = SIMD4(Float(a), Float(b), Float(max(0, min(14 + 30 * ease, 0.12 * min(a, b)))), Float(soft))
+        p.rim = SIMD4(Float(4 + 8 * breathe * (0.4 + 0.6 * locked)), Float(0.7 + 0.45 * ease + 0.2 * locked * breathe), Float(0.8 + 0.4 * ease), Float(t))
+        p.opacity = SIMD4(Float(0.30 * locked),                                      // tint: depth behind the message, not a grey dim
+                          Float(fade * (0.25 + 0.35 * ease + 0.10 * locked * breathe)),
+                          Float(fade * min(1, 0.6 + 2.5 * s) * (0.85 + 0.15 * breathe)),
+                          Float(0.45 * min(1, 4 * s) * (1 - locked)))                // a faint luminous edge on the front, never a line
+        let c = stops(t); withUnsafeMutableBytes(of: &p.stops) { $0.copyBytes(from: c.withUnsafeBytes { Array($0) }) }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        for m in [frostFeather, bloomFeather] { m.shadowPath = region; m.shadowRadius = soft }
-        bloom.opacity = Float(fade * (0.25 + 0.35 * ease + 0.10 * locked * breathe)); blur.alphaValue = fade
-        for (m, w, isRim) in rings {
-            if isRim { m.path = rimPath; m.lineWidth = 2 * w * (0.7 + 0.45 * ease + 0.2 * locked * breathe) }
-            else { m.path = frontPath; m.lineWidth = 2 * w * (0.8 + 0.4 * ease) }
-        }
-        rimGlow.opacity = Float(fade * min(1, 0.6 + 2.5 * s) * (0.85 + 0.15 * breathe))
-        frontGlow.opacity = Float(0.45 * min(1, 4 * s) * (1 - locked))   // a faint luminous edge on the front, never a line
-        tint.opacity = Float(0.30 * locked)                                          // depth behind the message, not a grey dim
+        blur.alphaValue = fade; drawFrost(p)
         CATransaction.commit()
-        let today = Date(); date.set(dayFmt.string(from: today)); clock.set(timeFmt.string(from: today))
+        glow.render(p)
+        if t - lastClock > 1 { lastClock = t; let today = Date(); date.set(dayFmt.string(from: today)); clock.set(timeFmt.string(from: today)) }
         reveal(level >= 0.93)
     }
     /// The button's label changes with a quick blur through, never a jump.
@@ -331,7 +414,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     var present = false, dodging = false, training = "", reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
     var camera = true, inCall = false, locked = false, poweringOff = false
     var liquids: [Liquid] = [], hud: NSWindow?, hudText: NSTextField?, keyMonitor: Any?
-    var blockedSeconds = 0.0
+    var blockedSeconds = 0.0, raisedAt = Date.distantPast, wroteAt = Date.distantPast, wroteMode = ""
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let ws = NSWorkspace.shared.notificationCenter
@@ -389,7 +472,13 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         out.setSampleBufferDelegate(self, queue: queue)
         if session.canAddOutput(out) { session.addOutput(out) }
-        queue.async { self.session.startRunning() }
+        // 15 frames/s: macOS runs its video effects (portrait, studio light) on every frame, twice as many as anything here needs
+        queue.async {
+            self.session.startRunning()
+            if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && $0.maxFrameRate >= 15 }), (try? dev.lockForConfiguration()) != nil {
+                dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15); dev.unlockForConfiguration()
+            }
+        }
         camera = true; log("camera \(dev.localizedName)")
     }
     func restartCamera() {
@@ -398,6 +487,9 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     }
     func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
         let now = Date()  // 2.5 frames/s while all is well, 6/s while something looks wrong
+        if level > 0.85, let live = CMSampleBufferGetImageBuffer(sb) {   // the camera picture on the cover
+            DispatchQueue.main.async { for l in self.liquids { l.camera?.contents = live } }
+        }
         guard now.timeIntervalSince(lastProcessed) > (level == 0 && pBar < RELEASE && training.isEmpty ? 0.4 : 0.16), let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         lastProcessed = now
         eye.send(pb)
@@ -422,6 +514,8 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             reason = L("no te veo", "can't see you"); return
         }
         if !present { reset("nobody in frame"); return }
+        // a "person" without a face (a coat on a chair, a back, a hand) must not keep the cover up for ever: after HOLD it counts as gone
+        if warning && !seen && now.timeIntervalSince(lastFaceAt) >= HOLD { reset("no face for \(Int(HOLD)) s"); return }
         if !training.isEmpty || now < graceUntil { pBar = 0; badSince = nil; return }
         if !seen { return }
         let p = (s["p"] as? NSNumber)?.doubleValue ?? 0
@@ -445,7 +539,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         if blocked { blockedSeconds += dt }
         if level <= 0 { if !liquids.isEmpty { dropLiquids() }; return }
         if liquids.isEmpty {
-            liquids = NSScreen.screens.map { Liquid(screen: $0, session: session, main: $0 == NSScreen.main || NSScreen.screens.count == 1, target: self, action: #selector(fixClicked)) }
+            liquids = NSScreen.screens.map { Liquid(frame: $0.frame, main: $0 == NSScreen.main || NSScreen.screens.count == 1, target: self, action: #selector(fixClicked)) }
             liquids.forEach { $0.win.orderFrontRegardless() }
         }
         let t = now.timeIntervalSince(t0)
@@ -538,7 +632,10 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
                                  : L("Sin correcciones por hoy", "No corrections left today"), enabled: left > 0)
             l.foot.set(L("Todo sigue funcionando por detrás.", "Everything keeps running in the background."))
         }
-        if blocked { NSApp.activate(ignoringOtherApps: true); liquids.forEach { $0.win.orderFrontRegardless() }; (liquids.first { $0.preview != nil } ?? liquids.first)?.win.makeKey() }
+        if blocked, let w = (liquids.first { $0.preview != nil } ?? liquids.first)?.win, !NSApp.isActive || !w.isKeyWindow || now.timeIntervalSince(raisedAt) > 3 {
+            raisedAt = now; if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }     // only when something took the front; repeating it is slow
+            liquids.forEach { $0.win.orderFrontRegardless() }; w.makeKey()
+        }
         var text = "", color = NSColor.systemGreen
         if now < noteUntil { text = note; color = .systemYellow }
         else if !camera { text = L("Postura: sin cámara (Ajustes → Privacidad → Cámara)", "Postura: no camera (Settings → Privacy → Camera)"); color = .systemOrange }
@@ -550,10 +647,13 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             let x = CATransition(); x.type = .fade; x.duration = 0.35; x.timingFunction = Kinetic.ease; h.layer?.add(x, forKey: "swap")
             h.stringValue = text; h.textColor = color
         }
-        if prefs.object(forKey: "showHUD") as? Bool ?? true { hud?.orderFrontRegardless() } else { hud?.orderOut(nil) }
+        if prefs.object(forKey: "showHUD") as? Bool ?? true { if hud?.isVisible == false { hud?.orderFrontRegardless() } } else { hud?.orderOut(nil) }
         shell.update(level: level, blocked: blocked, p: pBar, present: present || dodging, camera: camera, inCall: inCall,
                      reason: reason.prefix(1).uppercased() + reason.dropFirst(), secs: blockedSeconds, left: left)
-        let st: [String: Any] = ["mode": blocked ? "blocked" : level > 0 ? "filling" : "off", "level": level, "reason": reason, "p": pBar, "present": present,
+        let mode = blocked ? "blocked" : level > 0 ? "filling" : "off"
+        if mode == wroteMode, now.timeIntervalSince(wroteAt) < 2 { return }                  // every 2 s or on a change: less disk writing
+        wroteMode = mode; wroteAt = now
+        let st: [String: Any] = ["mode": mode, "level": level, "reason": reason, "p": pBar, "present": present,
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "fixesLeft": left, "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL) }
     }
@@ -786,9 +886,11 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
         }()
         if model.state != st { model.state = st }; if model.detail != d { model.detail = d }
         if model.symbol != sym { model.symbol = sym; item?.button?.image = NSImage(systemSymbolName: sym, accessibilityDescription: st) }
-        model.tint = tint; model.p = p; model.fixesLeft = left
-        model.blocked = secs < 60 ? "\(Int(secs)) s" : "\(Int(secs / 60)) min"
-        item?.button?.toolTip = "Postura · \(st)"
+        if model.tint != tint { model.tint = tint }
+        if window?.isVisible == true { model.p = p }
+        if model.fixesLeft != left { model.fixesLeft = left }
+        let bt = secs < 60 ? "\(Int(secs)) s" : "\(Int(secs / 60)) min"; if model.blocked != bt { model.blocked = bt }
+        let tip = "Postura · \(st)"; if item?.button?.toolTip != tip { item?.button?.toolTip = tip }
     }
 }
 let shell = Shell()
