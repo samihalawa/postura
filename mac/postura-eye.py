@@ -100,7 +100,8 @@ def rules(m):  # general knowledge: only clearly bad posture scores high
     for _, v in c: keep *= 1 - v
     return 1 - keep, why
 
-KM = ["pitch", "neck", "fwd", "noseY", "shY", "roll"]; SCALE = np.array([6, 0.05, 0.06, 0.06, 0.05, 6]); RADIUS, K = 0.8, 9
+# shTilt is part of the match: without it, dropped-shoulder examples also caught upright poses with level shoulders
+KM = ["pitch", "neck", "fwd", "noseY", "shY", "roll", "shTilt"]; SCALE = np.array([6, 0.05, 0.06, 0.06, 0.05, 6, 5]); RADIUS, K = 0.8, 9
 mem, mem_stamp = None, None
 def load_mem():
     global mem, mem_stamp
@@ -120,7 +121,7 @@ def judge(m):
     load_mem()
     if mem is not None and all(k in m for k in KM):
         X, y, T = mem; d = np.sqrt((((X - np.array([m[k] for k in KM])) / SCALE) ** 2).mean(1))
-        near = np.flatnonzero(d < RADIUS); near = near[np.lexsort((d[near], -T[near]))][:K]  # newest labels first, then closest
+        near = np.flatnonzero(d < RADIUS); near = near[np.lexsort((-T[near], d[near] // 0.2))][:K]  # closest first; among equally close ones the newest wins
         if len(near):
             pm = float(y[near].mean()); p = (len(near) * pm + 2 * p) / (len(near) + 2)
             if pm > 0.5 and p >= 0.5: why = W("examples")

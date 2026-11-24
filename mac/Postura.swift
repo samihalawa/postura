@@ -345,9 +345,10 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         eye.onSample = { s in DispatchQueue.main.async { self.handle(s, Date()) } }
         shell.start()
         AVCaptureDevice.requestAccess(for: .video) { ok in DispatchQueue.main.async { if ok { self.startCamera() } else { self.camera = false; log("camera denied") } } }
-        Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { _ in self.animate() }
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in self.tick() }
-        Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in self.checkCall() }
+        every(1.0 / 30) { self.animate() }
+        every(0.5) { self.tick() }
+        every(10) { self.checkCall() }
+        startWatchdog()
         checkCall(); showHUD(); installHotkeys()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in   // while blocked this app has the keyboard: plain G corrects it
             if self.blocked, e.charactersIgnoringModifiers?.lowercased() == "g" { self.teach("good") }
@@ -356,6 +357,26 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     }
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool { shell.show(); return false }
     func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply { poweringOff ? .terminateNow : .terminateCancel }
+
+    // Run-loop timers once stopped for good while the screen was covered (24 Nov 2026) although the main queue kept running, so
+    // everything periodic runs on the main queue. If the animation still stops, the watchdog ends the process: that removes the
+    // cover at once, and the guard or launchd starts a fresh copy. systemUptime stands still during sleep, so waking is no stall.
+    var sources: [DispatchSourceTimer] = []
+    let beatLock = NSLock(); var beat = ProcessInfo.processInfo.systemUptime
+    func every(_ s: Double, _ f: @escaping () -> Void) {
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + s, repeating: s, leeway: .milliseconds(s < 0.1 ? 2 : 50))
+        t.setEventHandler(handler: f); t.resume(); sources.append(t)
+    }
+    func startWatchdog() {
+        Thread.detachNewThread {
+            while true {
+                Thread.sleep(forTimeInterval: 2)
+                self.beatLock.lock(); let idle = ProcessInfo.processInfo.systemUptime - self.beat; self.beatLock.unlock()
+                if idle > 8 { log("watchdog: no animation for \(Int(idle)) s, restarting"); _exit(1) }
+            }
+        }
+    }
 
     // MARK: camera
     func startCamera() {
@@ -383,7 +404,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     }
 
     // MARK: judgement -> smoothed p
-    func reset(_ why: String) { if level > 0 || blocked { log("clear: \(why)") }; pBar = 0; badSince = nil }
+    func reset(_ why: String) { if (level > 0 || blocked) && pBar > 0 { log("clear: \(why)") }; pBar = 0; badSince = nil }
     func handle(_ s: [String: Any], _ now: Date) {
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
         lastFrame = now; lastSampleAt = now; lastSample = s
@@ -414,6 +435,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     // MARK: liquid level 0..1, 30 times a second
     func animate() {
         let now = Date(), dt = min(0.2, now.timeIntervalSince(lastAnim)); lastAnim = now
+        beatLock.lock(); beat = ProcessInfo.processInfo.systemUptime; beatLock.unlock()
         let bad = (present || dodging) && !locked && pBar >= BLOCK && badSince != nil && now.timeIntervalSince(badSince!) >= GRACE && now >= graceUntil
         let good = (!present && !dodging) || locked || pBar < RELEASE || now < graceUntil
         let cap = inCall ? 0.22 : 1.0     // on a call only a thin edge glow shows, it never blocks
