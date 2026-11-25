@@ -9,6 +9,7 @@ import SwiftUI
 import AVFoundation
 import Quartz
 import Vision
+import Accelerate
 import Carbon.HIToolbox
 
 let fm = FileManager.default
@@ -104,7 +105,7 @@ final class Line: NSView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         label.contentsScale = window?.backingScaleFactor ?? 2
         label.string = NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color])
-        if !text.isEmpty { let x = CATransition(); x.type = .fade; x.duration = 0.9; x.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut); label.add(x, forKey: "swap") }
+        if !text.isEmpty { let x = CATransition(); x.type = .fade; x.duration = 1.8; x.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut); label.add(x, forKey: "swap") }
         CATransaction.commit(); text = s
     }
 }
@@ -117,23 +118,27 @@ func fade(_ v: NSView, _ on: Bool, delay: Double, duration: Double) {
 }
 
 /// The person in front of the camera as a shape only: a 160x120 signed distance field (negative inside) from Vision's person mask.
-/// No picture is kept or shown. `cur` drifts towards `goal`, so the outline flows instead of stepping.
+/// and the face and clothes as a 320x240 light drawing (soft tone + strokes). Both drift slowly towards what the camera sees, so
+/// everything flows. No picture is kept.
 final class Silhouette {
     static let w = 160, h = 120
     private let queue = DispatchQueue(label: "postura.shape", qos: .userInitiated), lock = NSLock()
-    private var busy = false, wanted = false, goal: [Float]?, cur: [Float] = [], ring: [MTLTexture] = [], turn = 0
+    static let pw = 320, ph = 240
+    typealias Textures = (field: MTLTexture, drawing: MTLTexture)
+    private var busy = false, wanted = false, goal: [Float]?, cur: [Float] = [], artGoal: [Float] = [], art: [Float] = [], ring: [Textures] = [], turn = 0
     private let request: VNGeneratePersonSegmentationRequest = { let r = VNGeneratePersonSegmentationRequest(); r.qualityLevel = .balanced; r.outputPixelFormat = kCVPixelFormatType_OneComponent8; return r }()
     /// Called by the cover: shapes are only computed while one is on screen.
-    func want(_ on: Bool) { lock.lock(); if on && !wanted { goal = nil; cur = [] }; wanted = on; lock.unlock() }
+    func want(_ on: Bool) { lock.lock(); if on && !wanted { goal = nil; cur = []; art = [] }; wanted = on; lock.unlock() }
     func feed(_ pb: CVPixelBuffer) {
         lock.lock(); let go = wanted && !busy; if go { busy = true }; lock.unlock()
         guard go else { return }
         queue.async { [self] in
-            let f = autoreleasepool { () -> [Float]? in
+            let f = autoreleasepool { () -> (field: [Float], art: [Float])? in
                 guard (try? VNImageRequestHandler(cvPixelBuffer: pb).perform([request])) != nil, let m = request.results?.first?.pixelBuffer else { return nil }
-                return Silhouette.field(m)
+                guard let f = Silhouette.field(m), let a = Silhouette.drawing(pb, f) else { return nil }
+                return (f, a)
             }
-            lock.lock(); busy = false; if wanted, let f { goal = f }; lock.unlock()
+            lock.lock(); busy = false; if wanted, let f { goal = f.field; artGoal = f.art }; lock.unlock()
         }
     }
     /// nil when there is (almost) nobody in the mask.
@@ -156,7 +161,7 @@ final class Silhouette {
         }
         let a = chamfer(true), b = chamfer(false)
         var f = zip(a, b).map { ($0 - $1) / Float(h) }
-        for _ in 0..<3 {                                                                // rounds off the cells: a flowing line, not a cut-out
+        for _ in 0..<7 {                                                                // rounds off the cells: a flowing line, not a cut-out
             let g = f
             for y in 0..<h { for x in 0..<w {
                 var s: Float = 0; for dy in -1...1 { for dx in -1...1 { s += g[min(h - 1, max(0, y + dy)) * w + min(w - 1, max(0, x + dx))] } }
@@ -164,44 +169,96 @@ final class Silhouette {
         }
         return f
     }
+    /// Box blur by running sums, `n` times (three look like a Gaussian).
+    static func blur(_ a: [Float], _ r: Int, _ n: Int = 3) -> [Float] {
+        var src = a, dst = a; let k = 1 / Float(2 * r + 1)
+        for _ in 0..<n {
+            for (W, H, sx, sy) in [(pw, ph, 1, pw), (ph, pw, pw, 1)] {
+                src.withUnsafeBufferPointer { s in dst.withUnsafeMutableBufferPointer { d in
+                    for y in 0..<H {
+                        let o = y * sy; var sum: Float = 0
+                        for i in -r...r { sum += s[o + min(W - 1, max(0, i)) * sx] }
+                        for x in 0..<W { d[o + x * sx] = sum * k; sum += s[o + min(W - 1, x + r + 1) * sx] - s[o + max(0, x - r) * sx] }
+                    }
+                } }
+                swap(&src, &dst)
+            }
+        }
+        return src
+    }
+    /// Two values per cell: tone (0..1, light evened out over the person) and strokes (eyes, brows, glasses, nose, mouth, hair, collar).
+    static func drawing(_ pb: CVPixelBuffer, _ field: [Float]) -> [Float]? {
+        guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA else { return nil }
+        CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        let W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb), n = pw * ph
+        guard let b = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        var l = [Float](repeating: 0, count: n)
+        for y in 0..<ph { let row = b + (y * H / ph) * bpr; for x in 0..<pw { let q = row + (x * W / pw) * 4
+            l[y * pw + x] = (0.114 * Float(q[0]) + 0.587 * Float(q[1]) + 0.299 * Float(q[2])) / 255 } }
+        // the background is replaced by the person's own average, so the edge of the body draws no stroke (the outline already does)
+        var sum: Float = 0, cnt: Float = 0, mask = [Float](repeating: 0, count: n)
+        for y in 0..<ph { for x in 0..<pw where field[(y * h / ph) * w + x * w / pw] < 0 { let i = y * pw + x; mask[i] = 1; sum += l[i]; cnt += 1 } }
+        guard cnt > 100 else { return nil }
+        let mean = sum / cnt, soft = blur(mask, 3, 2)
+        for i in 0..<n { l[i] = mean + (l[i] - mean) * mask[i] }
+        let fine = blur(l, 1, 2), mid = blur(l, 3), wide = blur(l, 22)
+        var out = [Float](repeating: 0, count: n * 2)
+        for i in 0..<n {
+            let t = 0.5 + (mid[i] - wide[i]) * 1.2 + (wide[i] - mean) * 0.8
+            out[2 * i] = min(1, max(0, t))
+            out[2 * i + 1] = max(0, (mid[i] - fine[i]) / (0.06 + 0.5 * wide[i]) - 0.02) * soft[i] * 9
+        }
+        return out
+    }
     /// Once per animation frame; nil while there is no shape to show.
-    func texture() -> MTLTexture? {
-        lock.lock(); let g = goal; lock.unlock()
+    func textures() -> Textures? {
+        lock.lock(); let g = goal, a = artGoal; lock.unlock()
         guard let g, let dev = Glow.gpu?.dev else { return nil }
-        if cur.count != g.count { cur = g } else { for i in g.indices { cur[i] += (g[i] - cur[i]) * 0.14 } }
+        func drift(_ c: inout [Float], _ to: [Float], _ k: Float) {
+            if c.count != to.count { c = to } else { var k = k; vDSP_vintb(c, 1, to, 1, &k, &c, 1, vDSP_Length(to.count)) }
+        }
+        drift(&cur, g, 0.07); drift(&art, a, 0.08)
         if ring.isEmpty {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: Silhouette.w, height: Silhouette.h, mipmapped: false); d.usage = .shaderRead
-            ring = (0..<4).compactMap { _ in dev.makeTexture(descriptor: d) }
+            func make(_ f: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture? {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false); d.usage = .shaderRead; return dev.makeTexture(descriptor: d)
+            }
+            ring = (0..<4).compactMap { _ in make(.r32Float, Silhouette.w, Silhouette.h).flatMap { f in make(.rg32Float, Silhouette.pw, Silhouette.ph).map { (f, $0) } } }
         }
         guard !ring.isEmpty else { return nil }
         turn = (turn + 1) % ring.count
-        ring[turn].replace(region: MTLRegionMake2D(0, 0, Silhouette.w, Silhouette.h), mipmapLevel: 0, withBytes: cur, bytesPerRow: Silhouette.w * 4)
+        ring[turn].field.replace(region: MTLRegionMake2D(0, 0, Silhouette.w, Silhouette.h), mipmapLevel: 0, withBytes: cur, bytesPerRow: Silhouette.w * 4)
+        ring[turn].drawing.replace(region: MTLRegionMake2D(0, 0, Silhouette.pw, Silhouette.ph), mipmapLevel: 0, withBytes: art, bytesPerRow: Silhouette.pw * 8)
         return ring[turn]
     }
 }
 let silhouette = Silhouette()
 
-/// When the shape appears and how: every PERIOD s the outline is drawn by a passing light, holds, and dissolves outwards.
-/// Direction, number of echoes and inner light change each time, so no two look the same. It is never shown continuously.
+/// When the portrait appears and how. It condenses out of drifting light over some seconds, stays a while, breathing, and drifts
+/// apart again; then a pause. Meant to be looked at for minutes: nothing is quick, and every time the light comes from another
+/// side with another balance of flowing strands and soft tone.
 struct Apparition {
-    static let PERIOD = 8.0, LIFE = 5.2
-    var line: Float = 0, fill: Float = 0, grow: Float = 0, width: Float = 0, sweep: Float = 0, angle: Float = 0, echo: Float = 0, gap: Float = 0
+    static let PERIOD = 26.0, LIFE = 20.0
+    var line: Float = 0, fill: Float = 0, grow: Float = 0, width: Float = 0.01, sweep: Float = 0, angle: Float = 0, echo: Float = 0, gap: Float = 0.1
+    var tone: Float = 0, features: Float = 0, strands: Float = 0, warp: Float = 0
     var alive = false
     init(_ t: Double) {                                                                  // t = seconds since the message appeared
-        guard t >= 1.2 else { return }
-        let n = Int((t - 1.2) / Apparition.PERIOD), u = (t - 1.2) - Double(n) * Apparition.PERIOD
+        guard t >= 0.8 else { return }
+        let n = Int((t - 0.8) / Apparition.PERIOD), u = (t - 0.8) - Double(n) * Apparition.PERIOD
         guard u < Apparition.LIFE else { return }
-        func s(_ a: Double, _ b: Double) -> Float { let x = Float(min(1, max(0, (u - a) / (b - a)))); return x * x * (3 - 2 * x) }
+        func s(_ a: Double, _ b: Double) -> Float { let x = Float(min(1, max(0, (u - a) / (b - a)))); return x * x * x * (x * (6 * x - 15) + 10) }
         func r(_ k: Double) -> Float { let v = sin(Double(n + 1) * k) * 43758.5453; return Float(v - floor(v)) }
-        let out = s(2.5, Apparition.LIFE), go = s(0.3, 1.9)
-        alive = true; sweep = go; angle = (r(12.9898) - 0.5) * 2.4 + .pi / 2             // mostly upwards, from a different side every time
-        line = s(0.2, 0.8) * (1 - s(2.9, Apparition.LIFE)); fill = (0.35 + 0.65 * r(78.233)) * go * (1 - s(2.2, 4.0))
-        grow = 0.20 * out * (r(39.425) < 0.3 ? 0.35 : 1); width = 0.006 + 0.05 * out
-        echo = out * (1 - s(3.4, Apparition.LIFE)) * (r(3.17) < 0.35 ? 0.4 : 1); gap = 0.05 + 0.07 * out
+        let go = s(0, 6.5), out = s(12.5, Apparition.LIFE)
+        alive = true; sweep = go; angle = (r(12.9898) - 0.5) * 2.6 + .pi / 2
+        line = s(1.2, 6) * (1 - s(12, 18)) * (0.40 + 0.20 * r(5.1)); fill = s(1, 6) * (1 - s(12, 18))
+        features = s(0.6, 5.5) * (1 - s(13, 18.5)) * (0.8 + 0.2 * r(39.425))
+        strands = s(0, 5.0) * (1 - s(13.5, 19.5)) * (0.45 + 0.55 * r(78.233))
+        tone = s(0.2, 6.0) * (1 - s(12.5, 18)) * (0.65 + 0.35 * r(3.17))
+        warp = 0.055 * (1 - s(0, 7.5)) + 0.05 * out; grow = 0.10 * out; width = 0.009 + 0.035 * out + 0.012 * (1 - go)
+        echo = out * (1 - s(14.5, Apparition.LIFE)) * 0.3; gap = 0.05 + 0.08 * out
     }
 }
 
-/// The light of the warning, drawn in one small Metal pass (1/4 of the points, 30 fps) and stretched. Everything in it is soft, so it
+/// The light of the warning, drawn in one small Metal pass (at 1/2.5 of the points, 30 fps) and stretched. Everything in it is soft, so it
 /// looks the same as the former stack of full-resolution blurred layers, which cost the window server enough to slow the whole Mac.
 final class Glow {
     struct Params {
@@ -212,9 +269,10 @@ final class Glow {
         var frame = SIMD4<Float>(0, 0, 1, 1)          // where the camera frame lies: left, bottom, width, height
         var shapeA = SIMD4<Float>(0, 0, 0.01, 0)      // line, inner light, line width, growth (in frame heights)
         var shapeB = SIMD4<Float>(0, 0, 0, 0.1)       // sweep, its direction, echoes, their spacing
+        var shapeC = SIMD4<Float>(0, 0, 0, 0)         // tone, shadow of the features, strands, drift
         var stops: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = (.zero, .zero, .zero, .zero, .zero, .zero, .zero)
     }
-    static let scale: CGFloat = 4
+    static let scale: CGFloat = 2.5
     static let gpu: (dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLRenderPipelineState)? = {
         guard let d = MTLCreateSystemDefaultDevice(), let q = d.makeCommandQueue(), let lib = try? d.makeLibrary(source: shader, options: nil) else { log("no Metal"); return nil }
         let r = MTLRenderPipelineDescriptor(); r.vertexFunction = lib.makeFunction(name: "v"); r.fragmentFunction = lib.makeFunction(name: "f"); r.colorAttachments[0].pixelFormat = .rgba16Float
@@ -232,7 +290,7 @@ final class Glow {
         layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB); layer.contentsGravity = .resize; layer.magnificationFilter = .linear
     }
     /// Never waits on the main thread: a frame is skipped when two are still on their way.
-    func render(_ p: Params, _ shape: MTLTexture?) {
+    func render(_ p: Params, _ shape: Silhouette.Textures?) {
         guard let gpu = Glow.gpu else { return }
         lock.lock(); let busy = inFlight >= 2; if !busy { inFlight += 1 }; lock.unlock()
         if busy { return }
@@ -244,10 +302,10 @@ final class Glow {
             c.present(d); c.commit()
         }
     }
-    static func encode(_ p: Params, _ shape: MTLTexture?, into t: MTLTexture, _ c: MTLCommandBuffer, _ pipe: MTLRenderPipelineState) {
+    static func encode(_ p: Params, _ shape: Silhouette.Textures?, into t: MTLTexture, _ c: MTLCommandBuffer, _ pipe: MTLRenderPipelineState) {
         let r = MTLRenderPassDescriptor(); r.colorAttachments[0].texture = t; r.colorAttachments[0].loadAction = .dontCare; r.colorAttachments[0].storeAction = .store
         guard let e = c.makeRenderCommandEncoder(descriptor: r) else { return }
-        var q = p; e.setFragmentTexture(shape ?? Glow.blank, index: 0); e.setRenderPipelineState(pipe); e.setFragmentBytes(&q, length: MemoryLayout<Params>.stride, index: 0)
+        var q = p; e.setFragmentTexture(shape?.field ?? Glow.blank, index: 0); e.setFragmentTexture(shape?.drawing ?? Glow.blank, index: 1); e.setRenderPipelineState(pipe); e.setFragmentBytes(&q, length: MemoryLayout<Params>.stride, index: 0)
         e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
     }
     static func cdf(_ z: Float) -> Float { 1 / (1 + exp(-1.702 * min(20, max(-20, z)))) }
@@ -261,7 +319,7 @@ final class Glow {
     static let shader = """
     #include <metal_stdlib>
     using namespace metal;
-    struct P { float2 size, pad; float4 front, rim, op, frame, sa, sb; float4 st[7]; };
+    struct P { float2 size, pad; float4 front, rim, op, frame, sa, sb, sc; float4 st[7]; };
     struct V { float4 pos [[position]]; float2 uv; };
     vertex V v(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V o; o.pos = float4(q * 2 - 1, 0, 1); o.uv = q; return o; }
     static float cdf(float z) { return 1 / (1 + exp(-1.702 * clamp(z, -20.0, 20.0))); }
@@ -281,14 +339,20 @@ final class Glow {
         for (int i = 0; i < 6; i++) { float w = max(p.st[i + 1].w - p.st[i].w, 1e-4); c = mix(c, p.st[i + 1].rgb, clamp((a - p.st[i].w) / w, 0.0, 1.0)); }
         return c;
     }
-    static float at(texture2d<float> s, int2 i) { i = clamp(i, int2(0), int2(s.get_width() - 1, s.get_height() - 1)); return s.read(uint2(i)).r; }
-    static float field(texture2d<float> s, float2 uv) {                             // bilinear by hand: 32-bit floats are not filterable everywhere
+    static float2 at(texture2d<float> s, int2 i) { i = clamp(i, int2(0), int2(s.get_width() - 1, s.get_height() - 1)); return s.read(uint2(i)).rg; }
+    static float2 flow(float2 c, float t) {                                         // slow, smooth currents
+        float2 a = c * 3.1 + float2(0.11, -0.16) * t;
+        float2 v = float2(sin(a.y * 2.1 + 1.3 * sin(a.x * 1.3 + 0.07 * t)), cos(a.x * 1.9 + 1.2 * sin(a.y * 1.5 - 0.06 * t)));
+        float2 b = c.yx * 6.7 + v * 0.8 + 0.09 * t;
+        return v * 0.7 + 0.3 * float2(sin(b.x), cos(b.y));
+    }
+    static float2 field(texture2d<float> s, float2 uv) {                             // bilinear by hand: 32-bit floats are not filterable everywhere
         float2 x = uv * float2(s.get_width(), s.get_height()) - 0.5, fx = fract(x); int2 i = int2(floor(x));
         return mix(mix(at(s, i), at(s, i + int2(1, 0)), fx.x), mix(at(s, i + int2(0, 1)), at(s, i + int2(1, 1)), fx.x), fx.y);
     }
-    fragment float4 f(V in [[stage_in]], constant P& p [[buffer(0)]], texture2d<float> shape [[texture(0)]]) {
+    fragment float4 f(V in [[stage_in]], constant P& p [[buffer(0)]], texture2d<float> shape [[texture(0)]], texture2d<float> art [[texture(1)]]) {
         float2 q = (in.uv - 0.5) * p.size; float t = p.rim.w, R = length(q);
-        float ang = atan2(q.x, q.y) / (2 * M_PI_F) + t / 14;
+        float ang = atan2(q.x, q.y) / (2 * M_PI_F) + t / 60;
         float3 light = around(ang, p), wash = 0;
         float blur = min(0.35, 70 / (6.2832 * max(R, 1.0)));                          // the wash is blurred by 70 pt: wider in angle near the centre
         for (int i = -4; i <= 4; i++) wash += around(ang + blur * i * 0.45, p) * exp(-0.1 * float(i * i));
@@ -301,7 +365,7 @@ final class Glow {
             region = 1 - box(q, p.front.xy, 0.06, 1, p.front.z, t, 0, p.front.w);
             front = stroke(q, p.front.xy, 0.06, 1, p.front.z, t, 10 * p.rim.z, 36) * p.op.w;
         }
-        float2 e = p.size / 2; float k = p.rim.y, ra = p.rim.x, rt = t * 0.8 + 7, keep = 1;
+        float2 e = p.size / 2; float k = p.rim.y, ra = p.rim.x, rt = t * 0.35 + 7, keep = 1;
         keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 4 * k, 2); keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 10 * k, 6);
         keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 22 * k, 18); keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 44 * k, 52);
         float rim = (1 - keep) * p.op.z;
@@ -309,21 +373,31 @@ final class Glow {
         float w = p.op.y * region; o = float4(wash, 1) * w + o * (1 - w);
         o = float4(light, 1) * rim + o * (1 - rim);
         o = float4(light, 1) * front + o * (1 - front);
-        if (p.sa.x + p.sa.y + p.sb.z > 0.001) {                                         // the person as light: outline, inner glow, echoes
-            float2 c = (in.uv * p.size - p.frame.xy) / p.frame.zw;                      // 0..1 in the camera frame, y up
-            float edge = smoothstep(0.0, 0.16, c.x) * (1 - smoothstep(0.84, 1.0, c.x)) * smoothstep(0.10, 0.34, c.y) * (1 - smoothstep(0.90, 1.0, c.y));
-            float d = field(shape, float2(1 - c.x, 1 - c.y));                           // mirrored, like a mirror
-            d += 0.006 * sin(c.y * 21 + t * 1.3) * sin(c.x * 17 - t * 0.9);             // a slight breath, never a hard contour
-            float along = dot(c - 0.5, float2(cos(p.sb.y), sin(p.sb.y))) + 0.5;
-            float head = mix(-0.35, 1.5, p.sb.x), lit = 1 - smoothstep(head - 0.35, head, along);
-            float spark = exp(-pow((along - head + 0.1) / 0.10, 2.0)) * (1 - p.sb.x);
-            float w = p.sa.z, g = p.sa.w;
-            float L = exp(-pow((d - g) / w, 2.0)) * 0.9 + exp(-abs(d - g) / (w * 4 + 0.02)) * 0.35;
-            L *= p.sa.x * lit * mix(1.0, 0.45, saturate(g / 0.2)) * (1 + 1.2 * spark);
-            float E = 0; for (int i = 1; i <= 3; i++) E += exp(-pow((d - g * 0.5 - p.sb.w * i) / (0.010 + 0.006 * i), 2.0)) / (1 + i);
-            float F = d < 0 ? 0.10 + 0.55 * exp(d / 0.045) : 0.55 * exp(-d / 0.03) + 0.10 * exp(-d / 0.02);
-            float3 hue = around(ang * 0.5 + along * 0.7 + t / 20, p), glow = hue * (F * p.sa.y * lit * 0.8 + E * p.sb.z * 0.75) + mix(hue, float3(1), 0.62) * L;
-            glow = 1 - exp(-glow * edge * 1.15);
+        if (p.sa.x + p.sa.y + p.sb.z + p.sc.x + p.sc.y + p.sc.z > 0.001) {              // the person as light, condensing out of slow currents
+            float2 c0 = (in.uv * p.size - p.frame.xy) / p.frame.zw;                     // 0..1 in the camera frame, y up
+            float2 cur = flow(c0, t), c = c0 + cur * (p.sc.w + 0.0022);
+            float edge = smoothstep(0.0, 0.18, c0.x) * (1 - smoothstep(0.82, 1.0, c0.x)) * smoothstep(0.06, 0.34, c0.y) * (1 - smoothstep(0.72, 0.99, c0.y));
+            float2 m = float2(1 - c.x, 1 - c.y);                                        // like a mirror
+            float d = field(shape, m).r + 0.004 * sin(c.y * 13 + t * 0.5) * sin(c.x * 11 - t * 0.4);
+            float2 a = field(art, m);
+            float along = dot(c0 - 0.5, float2(cos(p.sb.y), sin(p.sb.y))) + 0.5 + 0.16 * cur.x + 0.10 * cur.y;
+            float head = mix(-0.1, 2.1, p.sb.x), lit = 1 - smoothstep(head - 0.8, head, along);
+            float w = p.sa.z, g = p.sa.w, in_ = 1 - smoothstep(-0.035, 0.0, d);
+            float pulse = 0.82 + 0.18 * sin(along * 5 - t * 0.45);                      // light travelling slowly along every line
+            float L = (exp(-pow((d - g) / w, 2.0)) * 0.45 + exp(-abs(d - g) / (w * 3 + 0.03)) * 0.45) * p.sa.x * pulse * mix(1.0, 0.4, saturate(g / 0.16));
+            float E = 0; for (int i = 1; i <= 3; i++) E += exp(-pow((d - g * 0.5 - p.sb.w * i) / (0.016 + 0.01 * i), 2.0)) / (1 + i);
+            // the face as the eye knows it: light where there is light, features as quiet shadow; spun out of strands that bend over its relief
+            float tone = smoothstep(0.02, 0.98, a.r), dark = (1 - exp(-a.g * 0.6)) * p.sc.y;
+            float sv = c.y * 64 + tone * 4.2 + cur.x * 1.1 + cur.y * 0.5 + 0.5 * sin(c.x * 5 + t * 0.12) - t * 0.10;
+            float sw = fwidth(sv), sd = abs(fract(sv) - 0.5), thick = 0.14 + 0.22 * tone;
+            float C = (1 - smoothstep(thick - 0.16, thick + 0.22 + sw, sd)) * (0.10 + 0.90 * tone) * smoothstep(1.1, 0.35, sw) * p.sc.z * (0.8 + 0.2 * pulse);
+            float T = (0.10 + 0.90 * pow(tone, 1.5)) * p.sc.x, hair = dark * (1 - smoothstep(0.25, 0.6, tone)) * 0.30;
+            float body = (T * 0.95 + C * 0.26) * (1 - 0.46 * dark) + hair * p.sc.x;   // dark hair and frames keep a faint sheen of their own
+            float F = d < 0 ? 0.06 + 0.40 * exp(d / 0.05) : 0.46 * exp(-d / 0.05);
+            float3 hue = around(ang * 0.35 + along * 0.6 + t / 70, p), hue2 = around(along * 0.8 + a.r * 0.35 - t / 90 + 0.4, p);
+            float3 glow = hue * (F * p.sa.y * 0.6 + E * p.sb.z * 0.6) + mix(hue, float3(1), 0.55) * L
+                        + in_ * mix(hue2, float3(1), 0.25 + 0.45 * tone) * body;
+            glow = 1 - exp(-glow * edge * lit * 1.2);
             o.rgb = o.rgb + glow * (1 - o.rgb * 0.75); o = float4(min(o.rgb, 1.0), o.a + (1 - o.a) * max(glow.r, max(glow.g, glow.b)));
         }
         return o;
@@ -374,15 +448,15 @@ final class Liquid {
         content.wantsLayer = true; button.wantsLayer = true; button.layer?.opacity = 0
         shuffle(0); from = to
     }
-    /// New random stop positions, eased over 1.2 s, so the colours drift around the edge. A stop is rgb + its place on the circle.
+    /// New random stop positions, eased over 9 s, so the colours drift around the edge. A stop is rgb + its place on the circle.
     func shuffle(_ t: Double) {
         from = stops(t); lastShuffle = t
-        var c = Liquid.palette.map { SIMD4($0.x, $0.y, $0.z, Float.random(in: 0...1)) }.sorted { $0.w < $1.w }
+        var c = Liquid.palette.shuffled().enumerated().map { SIMD4($1.x, $1.y, $1.z, (Float($0) + Float.random(in: 0...0.5)) / 6) }   // never two stops close together: no wedges
         var last = c[0]; last.w = 1; c.append(last); c[0].w = 0; to = c                // closes the circle with no seam
     }
     func stops(_ t: Double) -> [SIMD4<Float>] {
         guard from.count == to.count, !to.isEmpty else { return to }
-        let x = Float(min(1, max(0, (t - lastShuffle) / 1.2))), e = x * x * (3 - 2 * x)
+        let x = Float(min(1, max(0, (t - lastShuffle) / 9))), e = x * x * (3 - 2 * x)
         return zip(from, to).map { $0 + ($1 - $0) * e }
     }
     /// The frost mask: the same front as the glow, computed small (1/16) and stretched; dropped once the front has closed.
@@ -405,13 +479,13 @@ final class Liquid {
     /// The message fades in once, top to bottom, and out together.
     func reveal(_ on: Bool, t: Double) {
         guard on != shown else { return }; shown = on; if on { shownAt = t }
-        for (i, v) in [clock, date, title, why, foot].enumerated() { fade(v, on, delay: on ? 0.12 * Double(i) : 0, duration: on ? 1.0 : 0.3) }
+        for (i, v) in [clock, date, title, why, foot].enumerated() { fade(v, on, delay: on ? 0.25 * Double(i) : 0, duration: on ? 2.0 : 0.4) }
         if button.superview != nil { fade(button, on && button.isEnabled, delay: on ? 0.9 : 0, duration: on ? 0.8 : 0.3) }
     }
-    func draw(level: Double, t: Double, shape: MTLTexture?) {
-        if t - lastShuffle > 1.2 { shuffle(t) }
+    func draw(level: Double, t: Double, shape: Silhouette.Textures?) {
+        if t - lastShuffle > 9 { shuffle(t) }
         let bw = size.width, bh = size.height, short = min(bw, bh)
-        let s = CGFloat(min(1, max(0, level))), ease = s * s * (3 - 2 * s), breathe = CGFloat(0.5 + 0.5 * sin(1.3 * t))
+        let s = CGFloat(min(1, max(0, level))), ease = s * s * (3 - 2 * s), breathe = CGFloat(0.5 + 0.5 * sin(0.55 * t))
         let locked = CGFloat(min(1, max(0, (level - 0.88) / 0.12)))
         let fade = min(1, 6 * s)                                                     // everything eases in from nothing and back out
         let soft = 30 + 110 * ease                                                   // feather radius grows as the light moves in
@@ -420,14 +494,14 @@ final class Liquid {
         var p = Glow.Params()
         p.size = SIMD2(Float(bw), Float(bh)); p.front = SIMD4(Float(a), Float(b), Float(max(0, min(14 + 30 * ease, 0.12 * min(a, b)))), Float(soft))
         p.rim = SIMD4(Float(4 + 8 * breathe * (0.4 + 0.6 * locked)), Float(0.7 + 0.45 * ease + 0.2 * locked * breathe), Float(0.8 + 0.4 * ease), Float(t))
-        p.opacity = SIMD4(Float(0.66 * locked),                                      // tint: depth behind the message, not a grey dim
+        p.opacity = SIMD4(Float(0.74 * locked),                                      // tint: depth behind the message, not a grey dim
                           Float(fade * (0.25 + 0.35 * ease - 0.22 * locked + 0.06 * locked * breathe)),
                           Float(fade * min(1, 0.6 + 2.5 * s) * (0.85 + 0.15 * breathe)),
                           Float(0.45 * min(1, 4 * s) * (1 - locked)))                // a faint luminous edge on the front, never a line
         let fh = bh * 0.9, fw = fh * 4 / 3; p.frame = SIMD4(Float((bw - fw) / 2), 0, Float(fw), Float(fh))
         if shown, shape != nil {
             let a = Apparition(t - shownAt)
-            p.shapeA = SIMD4(a.line, a.fill, max(0.004, a.width), a.grow); p.shapeB = SIMD4(a.sweep, a.angle, a.echo, a.gap)
+            p.shapeA = SIMD4(a.line, a.fill, max(0.004, a.width), a.grow); p.shapeB = SIMD4(a.sweep, a.angle, a.echo, a.gap); p.shapeC = SIMD4(a.tone, a.features, a.strands, a.warp)
         }
         let c = stops(t); withUnsafeMutableBytes(of: &p.stops) { $0.copyBytes(from: c.withUnsafeBytes { Array($0) }) }
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -589,7 +663,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         let t = now.timeIntervalSince(t0)
         let showing = liquids.contains { $0.shown && Apparition(t - $0.shownAt + 0.6).alive }
         silhouette.want(showing)
-        let shape = showing ? silhouette.texture() : nil
+        let shape = showing ? silhouette.textures() : nil
         for l in liquids { l.draw(level: level, t: t, shape: shape) }
     }
     func dropLiquids() { liquids.forEach { $0.win.orderOut(nil) }; liquids = [] }
@@ -672,9 +746,9 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             default: return (L("Siéntate bien", "Sit up straight"), cap + L(" · se quita en cuanto corrijas la postura", " · this clears as soon as you fix your posture"))
             }
         }()
-        // the judge may change its mind several times a second; the words change only when the new reason has held for 3 s, at most every 6 s
+        // the judge may change its mind several times a second; the words change only when the new reason has held for 4 s, at most every 12 s
         if head + line != pendingKey { pendingKey = head + line; pendingAt = now }
-        if level > 0, message == nil || level < 0.9 || (now.timeIntervalSince(pendingAt) >= 3 && now.timeIntervalSince(messageAt) >= 6), message?.0 != head || message?.1 != line {
+        if level > 0, message == nil || level < 0.9 || (now.timeIntervalSince(pendingAt) >= 4 && now.timeIntervalSince(messageAt) >= 12), message?.0 != head || message?.1 != line {
             message = (head, line); messageAt = now
         }
         for l in liquids {
