@@ -66,8 +66,8 @@ go to `postura-eye.py`, which runs MediaPipe Pose Landmarker and Face Landmarker
 to 1 (bad) with a reason. The app smooths the score, then drives the glow: a rotating conic gradient shown through
 blurred strokes on the display edge, plus a colour wash and a frosted blur behind a slowly waving front. Every boundary is
 feathered with a GPU shadow mask, so there is no hard line anywhere. While the cover is up it
-shows no camera picture: your portrait condenses out of
-drifting light (your face and body spun from soft strands), stays a while and drifts apart, then pauses. The time and the message sit in the corners and change slowly, only when a new reason has held for 4 s.
+shows no camera picture: you appear, painted softly
+in your own colours without the background, with a slow aura of light around you; then you fade back and it pauses. The time and the message sit in the corners and change slowly, only when a new reason has held for 4 s.
 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second). Offline replay of
 a recording: `~/Library/Application\ Support/Postura/venv/bin/python3 postura-eye.py --video clip.mov`.
