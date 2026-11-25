@@ -65,8 +65,9 @@ than 22°, shoulders tilted more than 16°. The UI is in English, or Spanish whe
 go to `postura-eye.py`, which runs MediaPipe Pose Landmarker and Face Landmarker and returns a score from 0 (good)
 to 1 (bad) with a reason. The app smooths the score, then drives the glow: a rotating conic gradient shown through
 blurred strokes on the display edge, plus a colour wash and a frosted blur behind a slowly waving front. Every boundary is
-feathered with a GPU shadow mask, so there is no hard line anywhere. The lock screen shows the date and time; every line of
-text arrives and leaves character by character (fade, rise, blur to sharp), and a changed reason morphs in place.
+feathered with a GPU shadow mask, so there is no hard line anywhere. While the cover is up it
+shows no camera picture: every few seconds your outline (Vision's person mask, turned into a distance field) is drawn by a passing
+light, holds, and dissolves outwards. The time and the message sit in the corners and change slowly, only when a new reason has held for 3 s.
 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second). Offline replay of
 a recording: `~/Library/Application\ Support/Postura/venv/bin/python3 postura-eye.py --video clip.mov`.
