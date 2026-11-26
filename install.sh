@@ -18,9 +18,11 @@ agent_program() {
 
 homebrew_owns_app() {
   for brew_bin in "$(command -v brew || true)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
-    if [ -x "$brew_bin" ] && "$brew_bin" list --cask --versions postura >/dev/null 2>&1; then
-      return 0
-    fi
+    [ -x "$brew_bin" ] || continue
+    # Check the installed cask's directory without loading an untrusted tap.
+    caskroom=$("$brew_bin" --caskroom 2>/dev/null) || return 0
+    [ -n "$caskroom" ] || return 0
+    [ ! -d "$caskroom/postura" ] || return 0
   done
   return 1
 }
