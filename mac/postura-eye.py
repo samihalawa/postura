@@ -3,7 +3,7 @@
 # p = general rules for clearly bad posture, overridden by the user's own labelled examples when the current
 # measurements are close to them (newest labels win). Stores numbers only, never images.
 #   --video FILE   print one row per sampled frame (offline analysis and tests)
-import sys, json, math, os, time, collections
+import sys, json, math, os, time, tempfile
 import numpy as np
 import mediapipe as mp
 
@@ -17,7 +17,8 @@ if len(sys.argv) > 1 and not OFFLINE:
 ES = os.environ.get("POSTURA_LANG", "en") == "es"
 TXT = {"far": ("lejos", "far away"), "side": ("de lado", "turned away"), "roll": ("cabeza muy inclinada", "head tilted"),
        "slouch": ("encorvado: cabeza hundida y adelantada", "slouching: head sunk and forward"), "shoulders": ("hombros torcidos", "shoulders tilted"),
-       "examples": ("como tus ejemplos de mala postura", "like your bad-posture examples")}
+       "examples": ("como tus ejemplos de mala postura", "like your bad-posture examples"),
+       "glasses": ("sin gafas", "no glasses"), "sunglasses": ("gafas de sol", "sunglasses")}
 W = lambda k: TXT[k][0 if ES else 1]
 V = mp.tasks.vision
 RM = V.RunningMode.VIDEO
@@ -26,6 +27,12 @@ pose = V.PoseLandmarker.create_from_options(V.PoseLandmarkerOptions(
 face = V.FaceLandmarker.create_from_options(V.FaceLandmarkerOptions(
     base_options=mp.tasks.BaseOptions(model_asset_path=f"{M}/face_landmarker.task"), running_mode=RM, num_faces=3,
     output_facial_transformation_matrixes=True))
+CHECK_GLASSES = os.environ.get("POSTURA_GLASSES") == "1"
+GL = {"gafas": f"{SUP}/glasses_yes.npy", "singafas": f"{SUP}/glasses_no.npy"}
+embedder = V.ImageEmbedder.create_from_options(V.ImageEmbedderOptions(
+    base_options=mp.tasks.BaseOptions(model_asset_path=f"{M}/mobilenet_v3_small.tflite"),
+    l2_normalize=True)) if CHECK_GLASSES else None
+
 OWNER_FILE = f"{SUP}/owner-face-sface.npy"
 OWNER_MODEL = f"{M}/face_recognition_sface_2021dec_int8.onnx"
 OWNER_MIN_SIMILARITY = 0.52
@@ -84,6 +91,9 @@ def measure(rgb, ts, preview=False):
             except Exception:
                 # A failed optional recognition pass must never enable video or interrupt posture detection.
                 pass
+        if CHECK_GLASSES and m["eyePx"] >= 60 and abs(R[2][0]) < 0.5:
+            m["_emb"] = eye_embedding(rgb, lm)
+            m["shade"] = shade(rgb, lm)
         m.update(face=True, person=True, pitch=math.degrees(math.atan2(R[2][1], R[2][2])),      # + = face turned below the camera
                  yaw=math.degrees(math.asin(max(-1, min(1, -R[2][0])))), roll=math.degrees(math.atan2(R[1][0], R[0][0])),
                  dist=-T[2][3], noseY=lm[1].y, noseX=lm[1].x)
@@ -102,6 +112,49 @@ def measure(rgb, ts, preview=False):
                      shY=shY, shTilt=math.degrees(math.atan2(dy, abs(dx) + 1e-6)), sw2=sw2,
                      neck2=(shY - m["noseY"]) / sw2, lat=(m["noseX"] - (n[11].x + n[12].x) / 2) * 4 / 3 / sw2)
     return m
+
+def shade(rgb, lm):  # eye area brightness / cheek brightness: ~1 bare eyes or clear glasses, ~0.4 dark lenses
+    H, W = rgb.shape[:2]; P = lambda i: np.array([lm[i].x * W, lm[i].y * H]); r = []
+    def med(c, w, h):
+        x0, x1, y0, y1 = int(max(0, c[0] - w / 2)), int(min(W, c[0] + w / 2)), int(max(0, c[1] - h / 2)), int(min(H, c[1] + h / 2))
+        px = rgb[y0:y1, x0:x1].astype(np.float32); return float(np.median(px @ np.float32([0.299, 0.587, 0.114]))) if px.size else float("nan")
+    for a, b, cheek in ((33, 133, 50), (263, 362, 280)):
+        w = float(np.linalg.norm(P(a) - P(b))); r.append(med((P(a) + P(b)) / 2, w * 1.5, w * 0.9) / (med(P(cheek), w * 0.5, w * 0.5) + 1e-6))
+    valid = [v for v in r if math.isfinite(v)]
+    return sum(valid) / len(valid) if valid else 1.0
+
+def eye_embedding(rgb, lm):  # aligned eye-region crop -> image features (kept as numbers, the crop is discarded)
+    import cv2
+    a = np.array([lm[33].x * rgb.shape[1], lm[33].y * rgb.shape[0]]); b = np.array([lm[263].x * rgb.shape[1], lm[263].y * rgb.shape[0]])
+    c = (a + b) / 2; d = float(np.linalg.norm(b - a)) + 1e-6
+    A = cv2.getRotationMatrix2D((float(c[0]), float(c[1])), math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])), 160 / d)
+    A[0, 2] += 128 - c[0]; A[1, 2] += 56 - c[1]
+    crop = np.ascontiguousarray(cv2.warpAffine(rgb, A, (256, 112)))
+    return np.array(embedder.embed(mp.Image(image_format=mp.ImageFormat.SRGB, data=crop)).embeddings[0].embedding, np.float32)
+gl_mem, gl_stamp = None, None
+
+def glasses_reference():
+    global gl_mem, gl_stamp
+    try:
+        stamp = tuple(os.stat(f).st_mtime_ns for f in GL.values())
+        if stamp != gl_stamp:
+            gl_mem = tuple(np.load(f, allow_pickle=False) for f in GL.values())
+            gl_stamp = stamp
+    except (OSError, ValueError):
+        gl_mem, gl_stamp = None, None
+    return gl_mem
+
+def glasses_score(m):
+    refs = glasses_reference()
+    if refs is None or "_emb" not in m:
+        return 0.0, ""
+    with_glasses, without_glasses = refs
+    if any(rows.ndim != 2 or not len(rows) or rows.shape[1] != len(m["_emb"]) for rows in refs):
+        return 0.0, ""
+    similarity = float((with_glasses @ m["_emb"]).max() - (without_glasses @ m["_emb"]).max())
+    if m.get("shade", 1) < 0.55 and similarity <= 0:
+        return sig((0.45 - m["shade"]) / 0.03), "sunglasses"
+    return sig((-0.10 - similarity) / 0.03), "glasses"
 
 # ---- judgement ----
 sig = lambda z: 1 / (1 + math.exp(-max(-30, min(30, z))))
@@ -146,28 +199,79 @@ def judge(m):
         if len(near):
             pm = float(y[near].mean()); p = (len(near) * pm + 2 * p) / (len(near) + 2)
             if pm > 0.5 and p >= 0.5: why = W("examples")
+    if CHECK_GLASSES:
+        missing, kind = glasses_score(m)
+        m["glassesReady"] = glasses_reference() is not None
+        if missing >= .5 and p >= .5:
+            m["kind"] = "both"
+            return max(p, missing), f"{why} · {W(kind)}"
+        if missing > p:
+            m["kind"] = kind
+            return missing, W(kind)
     return p, why
 
-# ---- labelling: SUP/train holds "bad" or "good" -> the last 4 s and the next 6 s of measurements become examples ----
-recent, forward = collections.deque(maxlen=80), None
-def save(label, t, m, src="live"):
-    with open(EX, "a") as fh: fh.write(json.dumps({"label": label, "t": round(t, 1), "src": src, **{k: (round(float(v), 4) if isinstance(v, (float, np.floating)) else v) for k, v in m.items() if k[0] != "_"}}, default=float) + "\n")
+# A button labels the next six seconds of measurable camera frames.
+TRAIN_SECONDS = 6
+forward = None
+
+def save_posture(label, t, m):
+    row = {"label": label, "t": round(t, 1), "src": "live"}
+    row.update({k: v for k, v in m.items() if not k.startswith("_")})
+    with open(EX, "a") as fh:
+        fh.write(json.dumps(row, default=float) + "\n")
+
+def save_glasses(label, collected):
+    if not collected:
+        return
+    path = GL[label]
+    try:
+        older = np.load(path, allow_pickle=False)
+        if older.ndim == 2 and older.shape[1] == len(collected[0]):
+            collected = np.vstack([older, collected])
+    except (OSError, ValueError):
+        pass
+    with tempfile.NamedTemporaryFile(dir=SUP, delete=False) as fh:
+        pending = fh.name
+        try:
+            np.save(fh, np.asarray(collected))
+            fh.close()
+            os.replace(pending, path)
+        finally:
+            if os.path.exists(pending):
+                os.unlink(pending)
+
 def learn(t, m):
     global forward
-    if os.path.exists(TRAIN):
-        with open(TRAIN) as file:
-            words = file.read().split()
-        label = words[0] if words else ""
-        os.remove(TRAIN)
-        if label in ("bad", "good"):
-            for tt, mm in recent:
-                if tt >= t - 4 and mm["body"]: save(label, tt, mm)
-            forward = (label, t + 6)
-    if forward and t > forward[1]: forward = None
-    usable = m["face"] and m["body"]
-    if forward and usable: save(forward[0], t, m)
-    if m["face"]: recent.append((t, dict(m)))
-    return forward[0] if forward else ""
+    if forward and t >= forward["end"]:
+        label = forward["label"]
+        if label in GL:
+            save_glasses(label, forward["eyes"])
+        m["trainingSaved"] = forward["count"]
+        m["trainingFinished"] = label
+        forward = None
+    try:
+        pending = TRAIN + ".reading"
+        os.replace(TRAIN, pending)
+    except FileNotFoundError:
+        pass
+    else:
+        with open(pending) as fh:
+            label = fh.read().strip()
+        os.unlink(pending)
+        if forward is None and (label in ("bad", "good") or (CHECK_GLASSES and label in GL)):
+            forward = {"label": label, "end": t + TRAIN_SECONDS, "count": 0, "eyes": []}
+    if not forward:
+        return
+    label = forward["label"]
+    if label in GL and "_emb" in m:
+        forward["eyes"].append(m["_emb"])
+        forward["count"] += 1
+    elif label in ("good", "bad") and m["face"] and m["body"] and m["dist"] <= 85 and abs(m["yaw"]) <= 40:
+        save_posture(label, t, m)
+        forward["count"] += 1
+    m["training"] = label
+    m["trainingRemaining"] = round(forward["end"] - t, 2)
+
 
 last_tele = 0
 def telemetry(t, m):
@@ -194,6 +298,7 @@ def main():
             if (i - 1) % max(1, round(fps / 5)): continue
             m = measure(cv2.cvtColor(cv2.resize(b, (640, 480)), cv2.COLOR_BGR2RGB), round(seconds * 1000))
             m["p"], m["why"] = judge(m); m["t"] = round(seconds, 3)
+            m.pop("_emb", None)
             print(json.dumps(m, default=float, allow_nan=False), flush=True)
         return
     inp, t0 = sys.stdin.buffer, time.monotonic()
@@ -207,7 +312,8 @@ def main():
         rgb = np.ascontiguousarray(np.frombuffer(buf, np.uint8).reshape(H, W, 4)[:, :, [2, 1, 0]])
         try:
             t = time.time(); m = measure(rgb, int((time.monotonic() - t0) * 1000), preview)
-            m["training"] = learn(t, m); m["p"], m["why"] = judge(m); telemetry(t, m)
+            learn(t, m); m["p"], m["why"] = judge(m); telemetry(t, m)
+            m.pop("_emb", None)
             print(json.dumps(m, default=float, allow_nan=False), flush=True)
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)

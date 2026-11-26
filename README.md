@@ -8,7 +8,7 @@
 
 **Postura** monitors your posture on macOS. It waits for a clearly bad posture to persist, then gradually covers
 the display until you correct your posture. The screen clears on the first empty camera detection. Open Postura from the Dock to see
-your current status or correct a reading.
+your live camera view, current status, or posture feedback.
 
 Everything runs on the Mac. No camera frames are stored or sent. Postura stores numerical posture examples from the live camera.
 
@@ -26,7 +26,7 @@ Postura runs on macOS 14 or later on Apple silicon and Intel. It starts at login
 you close its window.
 
 - **Menu bar**: live posture status, feedback, and Settings.
-- **Window** (Dock → Postura): live status and **Good posture** / **Bad posture** feedback. Camera, language, and on-screen status are in **Settings**.
+- **Window** (Dock → Postura): live status and **Good posture** / **Bad posture** feedback. Camera, language, on-screen status, and the optional glasses requirement are in **Settings**.
 - **Log**: `~/Library/Logs/postura.log`, one line per decision.
 
 Uninstall: `brew uninstall --cask postura` (`--zap` also deletes your examples and logs), or
@@ -53,7 +53,7 @@ score, and reason. To test live detection with a recording, choose **OBS Virtual
 ## Teach it your posture
 
 - **Ctrl-Opt-Cmd-B**: "this posture is bad". **Ctrl-Opt-Cmd-G**: "this posture is good".
-- The last 4 seconds and the next 6 seconds of measurements become examples in
+- Hold the labelled posture until the six-second countdown finishes. Valid measurements become examples in
   `~/Library/Application Support/Postura/examples.jsonl`. Near an example, your labels win over the built-in rules,
   newest first.
 - The same feedback buttons are available in the Dock window and menu bar.
@@ -61,6 +61,12 @@ score, and reason. To test live detection with a recording, choose **OBS Virtual
 The built-in rules only flag clearly bad posture: head sunk towards the shoulders and pushed forward, head rolled more
 than 22°, shoulders tilted more than 16°. The UI is in English, or Spanish when that is the Mac's first language
 (or pick one in the window).
+
+## Require glasses
+
+Turn on **Require glasses** in Settings and record one live sample **With glasses** and one **Without glasses**.
+Once both examples are ready, consistently missing glasses can gradually cover the display. The glasses check is off
+by default. Postura saves numerical examples on this Mac.
 
 ## How it works
 

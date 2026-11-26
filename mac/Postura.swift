@@ -89,7 +89,8 @@ final class Eye {
         let p = Process(); p.executableURL = URL(fileURLWithPath: py)
         p.arguments = [root.appendingPathComponent("postura-eye.py").path]
         p.environment = ["POSTURA_MODELS": root.appendingPathComponent("models").path, "GLOG_minloglevel": "2", "TF_CPP_MIN_LOG_LEVEL": "2",
-                         "HOME": NSHomeDirectory(), "POSTURA_LANG": spanish ? "es" : "en", "POSTURA_HOME": supportDir.path]
+                         "HOME": NSHomeDirectory(), "POSTURA_LANG": spanish ? "es" : "en", "POSTURA_HOME": supportDir.path,
+                         "POSTURA_GLASSES": prefs.bool(forKey: "requireGlasses") ? "1" : "0"]
         let i = Pipe(), o = Pipe(); p.standardInput = i; p.standardOutput = o; p.standardError = FileHandle.nullDevice
         var buf = Data()
         o.fileHandleForReading.readabilityHandler = { h in
@@ -555,7 +556,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         startWatchdog()
         checkCall(); showHUD(); installHotkeys()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in   // while blocked this app has the keyboard: plain G corrects it
-            if self.blocked, e.charactersIgnoringModifiers?.lowercased() == "g" { self.teach("good") }
+            if self.blocked, e.charactersIgnoringModifiers?.lowercased() == "g" { self.fixClicked() }
             return nil
         }
     }
@@ -665,6 +666,11 @@ final class Guard: NSObject, NSApplicationDelegate {
     func handle(_ s: [String: Any], _ now: Date) {
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
         lastFrame = now; lastSampleAt = now; lastSample = s
+        if let saved = s["trainingSaved"] as? Int {
+            flash(saved > 0
+                  ? L("Ejemplo guardado", "Example saved")
+                  : L("No se registró un ejemplo. Mira a la cámara y repite.", "No example recorded. Face the camera and try again."))
+        }
         guard s["person"] as? Bool == true else { revealScreen("nobody in frame"); return }
         present = true
         if s["postureUnjudged"] as? String == "far" { revealScreen("person in background"); return }
@@ -744,19 +750,23 @@ final class Guard: NSObject, NSApplicationDelegate {
     // MARK: teaching and corrections
     // "good"/"bad": the last 4 s and next 6 s become posture examples (postura-eye.py). "good" while it says bad is a
     // correction: it also drains the liquid, limited per day so it cannot be used to slouch all day.
-    @objc func fixClicked() { teach("good") }
+    var glassesWarning: Bool { reasonKind == "glasses" || reasonKind == "sunglasses" }
+    @objc func fixClicked() { teach(glassesWarning ? "gafas" : "good") }
     func teach(_ label: String) {
+        guard (lastSample["training"] as? String ?? "").isEmpty else { return }
+        let eyewear = label == "gafas" || label == "singafas"
         guard lastSample["face"] as? Bool == true,
-              lastSample["body"] as? Bool == true,
+              (eyewear || lastSample["body"] as? Bool == true),
               (lastSample["kind"] as? String) != "unjudged",
               Date().timeIntervalSince(lastSampleAt) < 1.25 else {
-            flash(L("Colócate con la cara y los hombros visibles", "Keep your face and shoulders in view"))
+            flash(eyewear ? L("Mira a la cámara", "Face the camera") :
+                  L("Colócate con la cara y los hombros visibles", "Keep your face and shoulders in view"))
             return
         }
         do {
             try label.write(to: trainURL, atomically: true, encoding: .utf8)
             log("LABEL \(label) p=\(f2(pBar)) \(brief(lastSample))")
-            flash(L("Gracias. Mantén la postura unos segundos.", "Thanks. Hold that posture for a few seconds."))
+            flash(L("Preparando el ejemplo…", "Getting ready to record…"))
         } catch {
             flash(L("No se pudo guardar el ejemplo", "Could not save feedback"))
         }
@@ -802,6 +812,8 @@ final class Guard: NSObject, NSApplicationDelegate {
         let cap = reason.prefix(1).uppercased() + reason.dropFirst()
         let (head, line): (String, String) = {
             switch k {
+            case "glasses", "sunglasses": return (L("Ponte las gafas", "Put on your glasses"), cap)
+            case "both": return (L("Siéntate bien y ponte las gafas", "Sit up and put on your glasses"), cap)
             case "hidden": return (L("Vuelve frente a la cámara", "Come back in front of the camera"), L("Siéntate bien donde te vea", "Sit upright where the camera can see you"))
             default: return (L("Siéntate bien", "Sit up straight"), cap + L(" · se quita en cuanto corrijas la postura", " · this clears as soon as you fix your posture"))
             }
@@ -813,7 +825,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         for l in liquids {
             l.title.set(message?.0 ?? head); l.why.set(message?.1 ?? line)
-            l.setButton(L("Mi postura es buena", "My posture is good"), enabled: true)
+            l.setButton(glassesWarning ? L("Llevo mis gafas", "I’m wearing my glasses") : L("Mi postura es buena", "My posture is good"), enabled: true)
             l.foot.set("")
         }
         if blocked, let w = (liquids.first { $0.main } ?? liquids.first)?.win, !NSApp.isActive || !w.isKeyWindow || now.timeIntervalSince(raisedAt) > 3 {
@@ -833,7 +845,8 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         if prefs.object(forKey: "showHUD") as? Bool ?? true { if hud?.isVisible == false { hud?.orderFrontRegardless() } } else { hud?.orderOut(nil) }
         shell.update(level: level, blocked: blocked, p: pBar, present: present, camera: camera, inCall: inCall,
-                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), feedback: now < noteUntil ? note : "")
+                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), kind: reasonKind,
+                     feedback: now < noteUntil ? note : "", sample: stale <= 1.25 ? lastSample : [:])
         let mode = blocked ? "blocked" : level > 0 ? "filling" : "off"
         if mode == wroteMode, now.timeIntervalSince(wroteAt) < 2 { return }                  // every 2 s or on a change: less disk writing
         wroteMode = mode; wroteAt = now
@@ -871,6 +884,12 @@ let showNote = Notification.Name("io.github.samihalawa.postura.show")
 /// Everything the window and the menu show, refreshed twice a second by Guard.tick().
 final class Model: ObservableObject {
     @Published var settingsPresented = false
+    @Published var cameraAvailable = true
+    @Published var framingReady = false
+    @Published var glassesRequired = prefs.bool(forKey: "requireGlasses")
+    @Published var glassesReady = false
+    @Published var recordingLabel = ""
+    @Published var recordingTime = 0.0
     @Published var feedback = ""
     @Published var state = L("Iniciando", "Starting…")
     @Published var detail = ""
@@ -880,6 +899,54 @@ final class Model: ObservableObject {
     @Published var hud = prefs.object(forKey: "showHUD") as? Bool ?? true
     @Published var cameraDevice = prefs.string(forKey: "cameraDevice") ?? ""
     @Published var language = prefs.string(forKey: "language") ?? ""
+}
+
+struct CameraPreview: NSViewRepresentable {
+    let session: AVCaptureSession
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        let preview = AVCaptureVideoPreviewLayer(session: session)
+        preview.videoGravity = .resizeAspect
+        preview.backgroundColor = NSColor.black.cgColor
+        view.layer = preview
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {}
+}
+
+struct ExampleButton: View {
+    let label: String
+    let icon: String
+    let selected: Bool
+    let time: Double
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Label(label, systemImage: icon)
+                if selected {
+                    Text("\(max(1, Int(ceil(time)))) s")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .controlSize(.large)
+        .overlay {
+            if selected {
+                Capsule()
+                    .trim(from: 0, to: min(1, max(0, time / 6)))
+                    .stroke(.tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    .animation(.linear(duration: 0.4), value: time)
+                    .allowsHitTesting(false)
+            }
+        }
+        .accessibilityValue(selected ? L("Grabando", "Recording") : "")
+    }
 }
 
 struct PosturaView: View {
@@ -924,23 +991,37 @@ struct PosturaView: View {
                     .allowsHitTesting(false)
             }
 
+            VStack(alignment: .leading, spacing: 8) {
+                if model.cameraAvailable {
+                    CameraPreview(session: g.session)
+                        .frame(height: 212)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .accessibilityLabel(L("Vista de la cámara", "Live camera view"))
+                    if !model.framingReady {
+                        Text(L("Coloca la cara y los hombros dentro del encuadre.", "Sit so your face and shoulders are in view."))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button(L("Permitir acceso a la cámara", "Open Camera Settings")) {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            }
+
             VStack(alignment: .leading, spacing: 9) {
                 Text(L("Comentarios sobre tu postura", "Posture feedback")).font(.headline)
                 HStack(spacing: 8) {
-                    Button { teach("good") } label: {
-                        Label(L("Buena postura", "Good posture"), systemImage: "hand.thumbsup")
-                            .frame(maxWidth: .infinity)
-                    }
-                    Button { teach("bad") } label: {
-                        Label(L("Mala postura", "Bad posture"), systemImage: "hand.thumbsdown")
-                            .frame(maxWidth: .infinity)
-                    }
+                    ExampleButton(label: L("Buena postura", "Good posture"), icon: "hand.thumbsup",
+                                  selected: model.recordingLabel == "good", time: model.recordingTime) { teach("good") }
+                    ExampleButton(label: L("Mala postura", "Bad posture"), icon: "hand.thumbsdown",
+                                  selected: model.recordingLabel == "bad", time: model.recordingTime) { teach("bad") }
                 }
-                .controlSize(.large)
-                .disabled(!model.setup.isEmpty)
-                Text(model.feedback.isEmpty
-                     ? L("Usa estos botones si Postura se equivoca.", "Use these buttons if Postura gets it wrong.")
-                     : model.feedback)
+                .disabled(!model.recordingLabel.isEmpty || !model.setup.isEmpty)
+                Text(model.recordingLabel.isEmpty
+                     ? (model.feedback.isEmpty ? L("Marca tu postura si Postura se equivoca.", "Label your posture if Postura gets it wrong.") : model.feedback)
+                     : L("Mantén la postura hasta que termine la cuenta.", "Hold your posture until the countdown ends."))
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -965,6 +1046,27 @@ struct PosturaSettingsView: View {
                     prefs.set(value, forKey: "cameraDevice")
                     shell.relaunch()
                 }
+                Toggle(L("Exigir gafas", "Require glasses"), isOn: $model.glassesRequired)
+                    .onChange(of: model.glassesRequired) { _, value in
+                        prefs.set(value, forKey: "requireGlasses")
+                        g.eye.restart()
+                    }
+                    .disabled(!model.recordingLabel.isEmpty)
+                if model.glassesRequired {
+                    Text(model.glassesReady
+                         ? L("Puedes actualizar tus ejemplos con la cámara.", "Update your glasses examples with the camera.")
+                         : L("Graba un ejemplo con gafas y otro sin ellas.", "Record one example with glasses and one without."))
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        ExampleButton(label: L("Con gafas", "With glasses"), icon: "eyeglasses",
+                                      selected: model.recordingLabel == "gafas", time: model.recordingTime) { g.teach("gafas") }
+                        ExampleButton(label: L("Sin gafas", "Without glasses"), icon: "eye",
+                                      selected: model.recordingLabel == "singafas", time: model.recordingTime) { g.teach("singafas") }
+                    }.disabled(!model.recordingLabel.isEmpty)
+                    if !model.feedback.isEmpty && model.recordingLabel.isEmpty {
+                        Text(model.feedback).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Toggle(L("Mostrar estado en pantalla", "Show status on screen"), isOn: $model.hud)
                     .onChange(of: model.hud) { _, value in prefs.set(value, forKey: "showHUD") }
                 Picker(L("Idioma", "Language"), selection: $model.language) {
@@ -980,7 +1082,7 @@ struct PosturaSettingsView: View {
                 .keyboardShortcut(.defaultAction)
                 .padding([.trailing, .bottom], 18)
         }
-        .frame(width: 410, height: 215)
+        .frame(width: 438, height: model.glassesRequired ? 370 : 255)
     }
 }
 
@@ -1086,11 +1188,24 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
     }
 
     /// Called by Guard.tick(): status for the menu bar icon, the menu and the window.
-    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, feedback: String) {
+    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, kind: String, feedback: String, sample: [String: Any]) {
+        if model.cameraAvailable != camera { model.cameraAvailable = camera }
+        let inFrame = sample["face"] as? Bool == true && sample["body"] as? Bool == true
+        if model.framingReady != inFrame { model.framingReady = inFrame }
+        let label = sample["training"] as? String ?? ""
+        if model.recordingLabel != label { model.recordingLabel = label }
+        let remaining = (sample["trainingRemaining"] as? NSNumber)?.doubleValue ?? 0
+        if model.recordingTime != remaining { model.recordingTime = remaining }
+        if let ready = sample["glassesReady"] as? Bool, model.glassesReady != ready { model.glassesReady = ready }
         if model.feedback != feedback { model.feedback = feedback }
         let (st, d, sym, tint): (String, String, String, Color) = {
             if !model.setup.isEmpty { return (L("Preparando…", "Setting up…"), L("Primera vez: instalando el modelo", "First launch: installing the model"), "arrow.down.circle", .blue) }
             if !camera { return (L("Sin cámara", "No camera"), L("Permítela en Ajustes → Privacidad → Cámara", "Allow it in Settings → Privacy → Camera"), "video.slash", .orange) }
+            if level > 0 && (kind == "glasses" || kind == "sunglasses" || kind == "both") {
+                let title = kind == "both" ? L("Corrige la postura y ponte las gafas", "Sit up and put on your glasses")
+                    : L("Ponte las gafas", "Put on your glasses")
+                return (title, reason, "eyeglasses", blocked ? .red : .orange)
+            }
             if blocked { return (L("Corrige la postura", "Sit up to continue"), reason, "figure.fall", .red) }
             if level > 0 {
                 let action = L("Corrige la postura", "Adjust your posture")

@@ -15,7 +15,8 @@ lipo -create build/Postura-arm64 build/Postura-x86_64 -output "$APP/Contents/Mac
 cp mac/Info.plist "$APP/Contents/"; [ -n "${BUNDLE_ID:-}" ] && /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns mac/postura-eye.py "$APP/Contents/Resources/"
 for m in pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task \
-         face_landmarker/face_landmarker/float16/latest/face_landmarker.task; do
+         face_landmarker/face_landmarker/float16/latest/face_landmarker.task \
+         image_embedder/mobilenet_v3_small/float32/latest/mobilenet_v3_small.tflite; do
   f="$CACHE/$(basename "$m")"; [ -s "$f" ] || curl -fsSL "$MODELS/$m" -o "$f"; cp "$f" "$APP/Contents/Resources/models/"
 done
 SFACE=face_recognition_sface_2021dec_int8.onnx
