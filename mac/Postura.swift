@@ -1,4 +1,4 @@
-// Postura: camera posture guard for macOS. Clearly bad posture (or, once taught, no glasses) makes a glowing front close in
+// Postura: camera posture guard for macOS. Clearly bad posture makes a glowing front close in
 // over every display; when it has covered the screen, mouse, keyboard, Cmd-Tab and Force Quit are blocked until the posture
 // is fixed. The judgement (p = 0..1 bad, why) comes from postura-eye.py; this app owns the camera, the timing and the screens.
 // Out of frame, far away, turned away, screen locked or on a call: never blocks. Everything runs on the Mac; no images are saved.
@@ -18,7 +18,6 @@ let supportDir = ProcessInfo.processInfo.environment["POSTURA_HOME"].map { URL(f
     ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Postura")
 let statusURL = supportDir.appendingPathComponent("status.json")
 let trainURL = supportDir.appendingPathComponent("train")
-let privacyFeedbackURL = supportDir.appendingPathComponent("privacy-feedback")
 let logURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/postura.log")
 try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
 
@@ -38,14 +37,13 @@ func pythonPath() -> String? {
     return ([supportDir.appendingPathComponent("venv/bin/python3").path] + strict).first { fm.isExecutableFile(atPath: $0) }
 }
 let prefs = UserDefaults.standard
-func privacyEnabled() -> Bool { prefs.object(forKey: "privacyMode") as? Bool ?? false }
 func cameraDevices() -> [AVCaptureDevice] {
     AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external], mediaType: .video, position: .unspecified).devices
 }
 func f2(_ x: Double) -> String { String(format: "%.2f", x) }
 
 // The display score is smoothed. CoverTiming gates the actual cover on sustained observations.
-let BLOCK = 0.72, RELEASE = 0.40, FIXES_PER_DAY = 5
+let BLOCK = 0.72, RELEASE = 0.40
 
 struct CoverTiming {
     static let dwell = 5.0, fill = 5.0, clearDelay = 2.0, drain = 2.5
@@ -91,8 +89,7 @@ final class Eye {
         let p = Process(); p.executableURL = URL(fileURLWithPath: py)
         p.arguments = [root.appendingPathComponent("postura-eye.py").path]
         p.environment = ["POSTURA_MODELS": root.appendingPathComponent("models").path, "GLOG_minloglevel": "2", "TF_CPP_MIN_LOG_LEVEL": "2",
-                         "HOME": NSHomeDirectory(), "POSTURA_LANG": spanish ? "es" : "en", "POSTURA_HOME": supportDir.path,
-                         "POSTURA_GLASSES": requireGlasses() ? "1" : "0"]
+                         "HOME": NSHomeDirectory(), "POSTURA_LANG": spanish ? "es" : "en", "POSTURA_HOME": supportDir.path]
         let i = Pipe(), o = Pipe(); p.standardInput = i; p.standardOutput = o; p.standardError = FileHandle.nullDevice
         var buf = Data()
         o.fileHandleForReading.readabilityHandler = { h in
@@ -511,13 +508,12 @@ final class Guard: NSObject, NSApplicationDelegate {
     let session = AVCaptureSession(), queue = DispatchQueue(label: "postura.camera"), eye = Eye()
     let receiver = CameraReceiver(), videoOutput = AVCaptureVideoDataOutput()
     var lastFrame = Date.distantPast, lastProcessed = Date.distantPast, lastSampleAt = Date.distantPast
-    var pBar = 0.0, graceUntil = Date.distantPast
+    var pBar = 0.0
     var level = 0.0, blocked = false, releasing = false, lastAnim = Date(), t0 = Date()
-    var present = false, training = "", reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
+    var present = false, reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
     var cameraName = ""
     var coverTiming = CoverTiming()
     var lastCameraRestart = Date.distantPast
-    var paused = prefs.bool(forKey: "coachingPaused")
     var camera = true, inCall = false, locked = false, poweringOff = false
     private var ownerPreviewVisible = false
     var screenFrames: [NSRect] = [], liquids: [Liquid] = [], hud: NSWindow?, hudText: NSTextField?, keyMonitor: Any?
@@ -538,7 +534,6 @@ final class Guard: NSObject, NSApplicationDelegate {
         log("start")
         eye.onSample = { s, frame in
             DispatchQueue.main.async {
-                guard !self.paused else { return }
                 if let frame {
                     if self.blocked, let crop = s["ownerCrop"] as? [Double], crop.count == 3,
                        crop.allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
@@ -552,7 +547,7 @@ final class Guard: NSObject, NSApplicationDelegate {
             }
         }
         shell.start()
-        if !paused { requestCamera() }
+        requestCamera()
         if !underAgent && !strictMode { shell.show() }
         every(1.0 / 30) { self.animate() }
         every(0.5) { self.tick() }
@@ -565,7 +560,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
     }
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool { shell.show(); return false }
-    func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply { poweringOff || (!strictMode && !blocked) ? .terminateNow : .terminateCancel }
+    func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply { poweringOff ? .terminateNow : .terminateCancel }
 
     // Run-loop timers once stopped for good while the screen was covered (24 Nov 2026) although the main queue kept running, so
     // everything periodic runs on the main queue. If the animation still stops, the watchdog ends the process: that removes the
@@ -596,7 +591,6 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         AVCaptureDevice.requestAccess(for: .video) { allowed in
             DispatchQueue.main.async {
-                guard !self.paused else { return }
                 if allowed { self.startCamera() }
                 else { self.camera = false; log("camera permission denied") }
             }
@@ -640,7 +634,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
     }
     func restartCamera() {
-        guard !paused, camera, Date().timeIntervalSince(lastCameraRestart) >= 5 else { return }
+        guard camera, Date().timeIntervalSince(lastCameraRestart) >= 5 else { return }
         lastCameraRestart = Date()
         queue.async {
             if self.session.inputs.isEmpty { DispatchQueue.main.async { self.startCamera() }; return }
@@ -648,24 +642,9 @@ final class Guard: NSObject, NSApplicationDelegate {
             self.session.startRunning()
         }
     }
-    func setPaused(_ value: Bool) {
-        guard value != paused else { return }
-        paused = value
-        prefs.set(value, forKey: "coachingPaused")
-        revealScreen(value ? "coaching paused" : "coaching resumed")
-        if value {
-            queue.async { if self.session.isRunning { self.session.stopRunning() } }
-        } else if session.inputs.isEmpty {
-            requestCamera()
-        } else {
-            lastCameraRestart = Date.distantPast
-            restartCamera()
-        }
-        tick()
-    }
     func cameraFrame(_ pb: CVPixelBuffer) {
         let now = Date()  // 2.5 frames/s while all is well, 6/s while something looks wrong
-        let interval = privacyEnabled() ? 0.18 : (level == 0 && pBar < RELEASE && training.isEmpty ? 0.4 : 0.16)
+        let interval = level == 0 && pBar < RELEASE ? 0.4 : 0.16
         guard now.timeIntervalSince(lastProcessed) > interval else { return }
         if lastProcessed == .distantPast { log("camera delivering frames") }
         lastProcessed = now
@@ -686,33 +665,10 @@ final class Guard: NSObject, NSApplicationDelegate {
     func handle(_ s: [String: Any], _ now: Date) {
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
         lastFrame = now; lastSampleAt = now; lastSample = s
-        training = s["training"] as? String ?? ""
-        if let count = s["privacyFeedback"] as? Int {
-            flash(count > 0 ? L("Ejemplo guardado", "Feedback learned")
-                            : L("Se necesita una persona cerca", "Feedback needs one nearby person"))
-        }
         guard s["person"] as? Bool == true else { revealScreen("nobody in frame"); return }
-        if privacyEnabled() {
-            guard let verdict = s["privacy"] as? [String: Any] else { revealScreen("missing visibility result"); return }
-            let classification = verdict["reason"] as? String ?? "empty"
-            if classification == "empty" { revealScreen("no measurable person"); return }
-            present = true; reasonKind = "privacy"
-            let hide = verdict["hide"] as? Bool == true
-            if locked { coverTiming = CoverTiming() }
-            else if !releasing { coverTiming.observe(hide: hide, at: now, covering: level > 0) }
-            pBar = hide ? 1 : 0
-            switch classification {
-            case "close": reason = L("persona muy cerca", "person close to the screen")
-            case "gaze": reason = L("mirada sostenida", "sustained attention")
-            case "still": reason = L("persona quieta cerca", "person stationary nearby")
-            case "learned": reason = L("como tus ejemplos", "matches your examples")
-            default: if level <= 0 { reason = "" }
-            }
-            return
-        }
         present = true
         if s["postureUnjudged"] as? String == "far" { revealScreen("person in background"); return }
-        if locked || !training.isEmpty || now < graceUntil {
+        if locked {
             reset("posture correction")
             coverTiming = CoverTiming()
             return
@@ -737,7 +693,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
     }
     func brief(_ s: [String: Any]) -> String {
-        ["pitch", "roll", "yaw", "neck", "fwd", "noseY", "shY", "shTilt", "dist", "glasses", "faces"].compactMap { k in (s[k] as? NSNumber).map { "\(k)=\(f2($0.doubleValue))" } }.joined(separator: " ")
+        ["pitch", "roll", "yaw", "neck", "fwd", "noseY", "shY", "shTilt", "dist", "faces"].compactMap { k in (s[k] as? NSNumber).map { "\(k)=\(f2($0.doubleValue))" } }.joined(separator: " ")
     }
 
     // MARK: liquid level 0..1, 30 times a second
@@ -745,7 +701,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         let now = Date(), dt = min(0.2, now.timeIntervalSince(lastAnim)); lastAnim = now
         beatLock.lock(); beat = ProcessInfo.processInfo.systemUptime; beatLock.unlock()
         let motion = coverTiming.motion(at: now, covering: level > 0)
-        let good = paused || motion == .drain || locked || (!privacyEnabled() && (!training.isEmpty || now < graceUntil))
+        let good = motion == .drain || locked
         let cap = inCall ? 0.22 : 1.0
         // Finish an uncover before accumulating a new sustained verdict.
         if good && level > 0 { releasing = true; coverTiming = CoverTiming() }
@@ -788,62 +744,22 @@ final class Guard: NSObject, NSApplicationDelegate {
     // MARK: teaching and corrections
     // "good"/"bad": the last 4 s and next 6 s become posture examples (postura-eye.py). "good" while it says bad is a
     // correction: it also drains the liquid, limited per day so it cannot be used to slouch all day.
-    func enrollOwner() {
-        guard let python = pythonPath() else { return }
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image]
-        panel.allowsMultipleSelection = true
-        panel.prompt = L("Registrar", "Enroll")
-        panel.message = L("Selecciona fotos que muestren tu cara.", "Choose photos that show your face.")
-        guard panel.runModal() == .OK else { return }
-        let files = panel.urls.map(\.path)
-        let resources = Bundle.main.resourceURL!
-        DispatchQueue.global(qos: .userInitiated).async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: python)
-            p.arguments = [resources.appendingPathComponent("postura-eye.py").path, "--enroll-owner"] + files
-            var environment = ProcessInfo.processInfo.environment
-            environment["POSTURA_HOME"] = supportDir.path
-            environment["POSTURA_MODELS"] = resources.appendingPathComponent("models").path
-            p.environment = environment
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            let ok = (try? p.run()) != nil && ({ p.waitUntilExit(); return p.terminationStatus == 0 })()
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.messageText = ok ? L("Cara registrada", "Face enrolled") : L("No se pudo registrar la cara", "Could not enroll the face")
-                alert.informativeText = ok ? L("El vídeo solo aparece cuando hay una cara y coincide con estas fotos.", "Video appears only when one face is present and matches these photos.")
-                    : L("Usa fotos nítidas de una sola persona.", "Use clear photos of one person.")
-                alert.runModal()
-            }
-        }
-    }
-
     @objc func fixClicked() { teach("good") }
-    func fixesLeft() -> Int { max(0, FIXES_PER_DAY - UserDefaults.standard.integer(forKey: "fixes-" + String(stamp.string(from: Date()).prefix(10)))) }
     func teach(_ label: String) {
-        if privacyEnabled(), label == "good" || label == "bad" {
-            let verdict = label == "bad" ? "hide" : "reveal"
-            do {
-                try verdict.write(to: privacyFeedbackURL, atomically: true, encoding: .utf8)
-                if verdict == "reveal" { revealScreen("visibility feedback") }
-                flash(L("Guardando el ejemplo…", "Saving feedback…"))
-            } catch {
-                flash(L("No se pudo guardar el ejemplo", "Could not save feedback"))
-            }
+        guard lastSample["face"] as? Bool == true,
+              lastSample["body"] as? Bool == true,
+              (lastSample["kind"] as? String) != "unjudged",
+              Date().timeIntervalSince(lastSampleAt) < 1.25 else {
+            flash(L("Colócate con la cara y los hombros visibles", "Keep your face and shoulders in view"))
             return
         }
-        let now = Date(); var label = label
-        if label == "good" && (level > 0 || pBar >= 0.5) {
-            let key = "fixes-" + String(stamp.string(from: now).prefix(10)), used = UserDefaults.standard.integer(forKey: key)
-            if used >= FIXES_PER_DAY { flash(L("Sin más correcciones hoy", "No corrections left today") + " (\(FIXES_PER_DAY)/\(FIXES_PER_DAY))"); log("FIX refused: limit reached"); return }
-            UserDefaults.standard.set(used + 1, forKey: key)
-            if reasonKind == "glasses" || reasonKind == "sunglasses" { label = "gafas" }      // "I do have my glasses on"
-            log("FIX \(used + 1)/\(FIXES_PER_DAY) as \(label), was: \(reason) p=\(f2(pBar)) \(brief(lastSample))")
-            graceUntil = now.addingTimeInterval(8); pBar = 0
-        } else { log("LABEL \(label) p=\(f2(pBar)) \(brief(lastSample))") }
-        try? label.write(to: trainURL, atomically: true, encoding: .utf8)
-        flash(label == "bad" ? L("Aprendiendo: esta postura es MALA…", "Learning: this posture is BAD…") : label == "gafas" ? L("Aprendiendo: llevas las gafas puestas…", "Learning: you are wearing your glasses…") : L("Aprendiendo: esta postura es BUENA…", "Learning: this posture is GOOD…"))
+        do {
+            try label.write(to: trainURL, atomically: true, encoding: .utf8)
+            log("LABEL \(label) p=\(f2(pBar)) \(brief(lastSample))")
+            flash(L("Gracias. Mantén la postura unos segundos.", "Thanks. Hold that posture for a few seconds."))
+        } catch {
+            flash(L("No se pudo guardar el ejemplo", "Could not save feedback"))
+        }
     }
     func flash(_ s: String) { note = s; noteUntil = Date().addingTimeInterval(6) }
     func installHotkeys() {
@@ -882,15 +798,11 @@ final class Guard: NSObject, NSApplicationDelegate {
         let stale = now.timeIntervalSince(lastFrame)
         if stale > 1.25, present || level > 0 { revealScreen("no frames") }
         if stale > 12, now.timeIntervalSince(lastCameraRestart) > 12, camera, !locked { restartCamera() }                       // lid was closed, camera taken away, etc.
-        let k = reasonKind, left = fixesLeft(), glasses = k == "glasses" || k == "sunglasses"
+        let k = reasonKind
         let cap = reason.prefix(1).uppercased() + reason.dropFirst()
         let (head, line): (String, String) = {
             switch k {
-            case "glasses": return (L("Ponte las gafas", "Put your glasses on"), L("Sin gafas · se quita en cuanto te las pongas", "No glasses · this clears as soon as you put them on"))
-            case "sunglasses": return (L("Ponte tus gafas", "Put your glasses on"), L("Las gafas de sol no cuentan · ponte las tuyas", "Sunglasses don't count · wear your own glasses"))
-            case "privacy": return (blocked ? L("Pantalla oculta", "Screen hidden") : L("Ocultando pantalla", "Covering screen"), cap)
-            case "both": return (L("Siéntate bien y ponte las gafas", "Sit up and put your glasses on"), cap + L(" · se quita cuando arregles las dos cosas", " · clears when both are fixed"))
-            case "hidden": return (L("Vuelve frente a la cámara", "Come back in front of the camera"), L("Apartarte no lo quita · siéntate bien donde te vea", "Moving out of view doesn't clear it · sit up where I can see you"))
+            case "hidden": return (L("Vuelve frente a la cámara", "Come back in front of the camera"), L("Siéntate bien donde te vea", "Sit upright where the camera can see you"))
             default: return (L("Siéntate bien", "Sit up straight"), cap + L(" · se quita en cuanto corrijas la postura", " · this clears as soon as you fix your posture"))
             }
         }()
@@ -901,15 +813,8 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         for l in liquids {
             l.title.set(message?.0 ?? head); l.why.set(message?.1 ?? line)
-            if privacyEnabled() {
-                l.setButton(L("Mostrar en esta situación — pulsa G o haz clic", "Reveal in this situation — press G or click"), enabled: true)
-                l.foot.set("")
-                continue
-            }
-            l.setButton(left > 0 ? (glasses ? L("Las llevo puestas — pulsa G o haz clic (quedan \(left) hoy)", "I'm wearing them — press G or click (\(left) left today)")
-                                            : L("Estoy bien sentado — pulsa G o haz clic (quedan \(left) hoy)", "I'm sitting fine — press G or click (\(left) left today)"))
-                                 : L("Sin correcciones por hoy", "No corrections left today"), enabled: left > 0)
-            l.foot.set(L("Todo sigue funcionando por detrás.", "Everything keeps running in the background.") + (left > 0 ? "" : L("  Sin correcciones por hoy.", "  No corrections left today.")))
+            l.setButton(L("Mi postura es buena", "My posture is good"), enabled: true)
+            l.foot.set("")
         }
         if blocked, let w = (liquids.first { $0.main } ?? liquids.first)?.win, !NSApp.isActive || !w.isKeyWindow || now.timeIntervalSince(raisedAt) > 3 {
             raisedAt = now; if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }     // only when something took the front; repeating it is slow
@@ -917,20 +822,8 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         var text = "", color = NSColor.systemGreen
         if now < noteUntil { text = note; color = .systemYellow }
-        else if paused { text = L("Postura en pausa", "Postura paused"); color = .systemGray }
         else if !camera { text = L("Postura: sin cámara (Ajustes → Privacidad → Cámara)", "Postura: no camera (Settings → Privacy → Camera)"); color = .systemOrange }
         else if !present { text = L("Postura: no te veo, no hago nada", "Postura: can't see you, doing nothing"); color = .systemGray }
-        else if privacyEnabled() {
-            if blocked {
-                text = L("Pantalla oculta · ", "Screen hidden · ") + reason
-                color = .systemRed
-            } else if level > 0 {
-                text = releasing ? L("Mostrando pantalla", "Revealing screen") : L("Ocultando pantalla", "Covering screen")
-                color = .systemYellow
-            } else {
-                text = L("Pantalla visible", "Screen visible")
-            }
-        }
         else if pBar >= BLOCK { text = "● \(L("MAL", "BAD")) \(Int(pBar * 100))% · \(reason)"; color = .systemRed }
         else if pBar >= RELEASE { text = "● \(L("dudoso", "unsure")) \(Int(pBar * 100))% · \(reason)"; color = .systemYellow }
         else { text = "● \(L("bien", "good")) \(Int(pBar * 100))%   " + L("⌃⌥⌘B = esto es malo · ⌃⌥⌘G = esto es bueno", "⌃⌥⌘B = this is bad · ⌃⌥⌘G = this is good") }
@@ -940,16 +833,14 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         if prefs.object(forKey: "showHUD") as? Bool ?? true { if hud?.isVisible == false { hud?.orderFrontRegardless() } } else { hud?.orderOut(nil) }
         shell.update(level: level, blocked: blocked, p: pBar, present: present, camera: camera, inCall: inCall,
-                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), secs: blockedSeconds, left: left, paused: paused)
+                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), feedback: now < noteUntil ? note : "")
         let mode = blocked ? "blocked" : level > 0 ? "filling" : "off"
         if mode == wroteMode, now.timeIntervalSince(wroteAt) < 2 { return }                  // every 2 s or on a change: less disk writing
         wroteMode = mode; wroteAt = now
         var st: [String: Any] = ["mode": mode, "level": level, "reason": reason, "p": pBar, "present": present,
-                                 "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "fixesLeft": left, "at": Int(now.timeIntervalSince1970), "sample": lastSample]
+                                 "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         st["ownerPreview"] = ownerPreviewVisible
         st["camera"] = cameraName
-        st["privacyMode"] = privacyEnabled()
-        st["paused"] = paused
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL, options: .atomic) }
     }
     func checkCall() {
@@ -970,8 +861,6 @@ let agentURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/La
 /// Strict mode (root daemons, see mac/install.sh) keeps the app alive itself; the per-user agent is then not used.
 let strictMode = fm.fileExists(atPath: "/Library/LaunchDaemons/com.sami.postura.plist")
 let underAgent = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == agentLabel
-func requireGlasses() -> Bool { prefs.object(forKey: "requireGlasses") as? Bool ?? false }
-func keepRunning() -> Bool { prefs.object(forKey: "keepRunning") as? Bool ?? false }
 @discardableResult func sh(_ cmd: String) -> Int32 {
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", cmd]
     p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
@@ -981,99 +870,117 @@ let showNote = Notification.Name("io.github.samihalawa.postura.show")
 
 /// Everything the window and the menu show, refreshed twice a second by Guard.tick().
 final class Model: ObservableObject {
-    @Published var paused = prefs.bool(forKey: "coachingPaused")
-    @Published var state = ""
+    @Published var settingsPresented = false
+    @Published var feedback = ""
+    @Published var state = L("Iniciando", "Starting…")
     @Published var detail = ""
     @Published var symbol = "figure.stand"
     @Published var tint = Color.green
-    @Published var p = 0.0
-    @Published var blocked = "0 s"
-    @Published var fixesLeft = FIXES_PER_DAY
     @Published var setup = ""
-    @Published var glasses = requireGlasses()
     @Published var hud = prefs.object(forKey: "showHUD") as? Bool ?? true
-    @Published var keep = keepRunning()
-    @Published var privacy = privacyEnabled()
     @Published var cameraDevice = prefs.string(forKey: "cameraDevice") ?? ""
     @Published var language = prefs.string(forKey: "language") ?? ""
 }
 
-struct SettingsView: View {
-    @ObservedObject var m: Model
+struct PosturaView: View {
+    @ObservedObject var model: Model
     let teach: (String) -> Void
+
     var body: some View {
-        Form {
-            Section {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                Text("Postura").font(.system(size: 26, weight: .semibold))
+                Spacer()
+                Button { model.settingsPresented = true } label: {
+                    Label(L("Ajustes", "Settings"), systemImage: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut(",", modifiers: .command)
+            }
+
+            VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 14) {
-                    Image(systemName: m.symbol).font(.system(size: 26, weight: .medium)).foregroundStyle(m.tint)
-                        .frame(width: 44, height: 44).background(m.tint.opacity(0.15), in: Circle())
-                        .contentTransition(.symbolEffect(.replace))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(m.state).font(.title3.weight(.semibold)).contentTransition(.opacity)
-                        Text(m.detail).font(.callout).foregroundStyle(.secondary).lineLimit(2).contentTransition(.opacity)
+                    Image(systemName: model.symbol)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(model.tint)
+                        .frame(width: 52, height: 52)
+                        .background(model.tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 14))
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.state).font(.title3.weight(.semibold))
+                        if !model.detail.isEmpty {
+                            Text(model.detail).font(.callout).foregroundStyle(.secondary)
+                        }
                     }
+                    Spacer(minLength: 0)
+                    if !model.setup.isEmpty { ProgressView().controlSize(.small) }
                 }
-                .padding(.vertical, 4).animation(.smooth, value: m.state).animation(.smooth, value: m.detail)
-                if !m.setup.isEmpty { ProgressView() }
-                HStack {
-                    Button {
-                        g.setPaused(!m.paused)
-                    } label: {
-                        Label(m.paused ? L("Reanudar", "Resume coaching") : L("Pausar", "Pause coaching"),
-                              systemImage: m.paused ? "play.fill" : "pause.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Spacer()
-                    Text(L("Bloqueo hoy", "Covered today") + " · " + m.blocked)
-                        .foregroundStyle(.secondary)
-                }
+
             }
-            Section {
-                HStack {
-                    Button { teach("good") } label: { Label(m.privacy ? L("Debe mostrar", "Should Reveal") : L("Buena postura", "Good posture"), systemImage: "hand.thumbsup") }
-                    Button { teach("bad") } label: { Label(m.privacy ? L("Debe ocultar", "Should Hide") : L("Mala postura", "Bad posture"), systemImage: "hand.thumbsdown") }
-                }
-                if m.glasses && !m.privacy {
-                    HStack {
-                        Button { teach("gafas") } label: { Label(L("Llevo gafas", "Wearing glasses"), systemImage: "eyeglasses") }
-                        Button { teach("singafas") } label: { Label(L("Sin gafas", "No glasses"), systemImage: "eye") }
+            .padding(16)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16).strokeBorder(.separator.opacity(0.6))
+                    .allowsHitTesting(false)
+            }
+
+            VStack(alignment: .leading, spacing: 9) {
+                Text(L("Comentarios sobre tu postura", "Posture feedback")).font(.headline)
+                HStack(spacing: 8) {
+                    Button { teach("good") } label: {
+                        Label(L("Buena postura", "Good posture"), systemImage: "hand.thumbsup")
+                            .frame(maxWidth: .infinity)
+                    }
+                    Button { teach("bad") } label: {
+                        Label(L("Mala postura", "Bad posture"), systemImage: "hand.thumbsdown")
+                            .frame(maxWidth: .infinity)
                     }
                 }
-            } header: { Text(L("Enseñar", "Teach")) } footer: {
-                Text(m.privacy ? L("Corrige la decisión actual. Atajos: ⌃⌥⌘G mostrar, ⌃⌥⌘B ocultar.", "Correct the current decision. Shortcuts: ⌃⌥⌘G reveal, ⌃⌥⌘B hide.") : L("Marca lo que ves ahora; aprende de los próximos segundos. Atajos: ⌃⌥⌘G buena, ⌃⌥⌘B mala.",
-                       "Labels what the camera sees now and over the next few seconds. Shortcuts: ⌃⌥⌘G good, ⌃⌥⌘B bad."))
+                .controlSize(.large)
+                .disabled(!model.setup.isEmpty)
+                Text(model.feedback.isEmpty
+                     ? L("Usa estos botones si Postura se equivoca.", "Use these buttons if Postura gets it wrong.")
+                     : model.feedback)
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section {
-                DisclosureGroup(L("Ajustes avanzados", "Advanced settings")) {
-                Toggle(L("Cubrir si alguien se acerca", "Cover when someone is nearby"), isOn: $m.privacy).onChange(of: m.privacy) { _, v in
-                    prefs.set(v, forKey: "privacyMode"); g.revealScreen("mode changed")
-                }
-                if m.privacy {
-                    Text(L("Usa la cercanía en lugar de la postura.", "Uses proximity instead of posture.")).foregroundStyle(.secondary)
-                }
-                Picker(L("Cámara", "Camera"), selection: $m.cameraDevice) {
+        }
+        .padding(22)
+        .frame(width: 458)
+        .fixedSize(horizontal: false, vertical: true)
+        .sheet(isPresented: $model.settingsPresented) { PosturaSettingsView(model: model) }
+    }
+}
+
+struct PosturaSettingsView: View {
+    @ObservedObject var model: Model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            Form {
+                Picker(L("Cámara", "Camera"), selection: $model.cameraDevice) {
                     Text(L("Automática", "Automatic")).tag("")
                     ForEach(cameraDevices(), id: \.uniqueID) { device in Text(device.localizedName).tag(device.uniqueID) }
-                }.onChange(of: m.cameraDevice) { _, v in
-                    prefs.set(v, forKey: "cameraDevice"); shell.relaunch()
+                }.onChange(of: model.cameraDevice) { _, value in
+                    prefs.set(value, forKey: "cameraDevice")
+                    shell.relaunch()
                 }
-                Button(L("Registrar mi cara para el vídeo", "Enroll my face for the camera preview")) { g.enrollOwner() }
-                if !m.privacy {
-                    Toggle(L("Exigir gafas", "Require glasses"), isOn: $m.glasses).onChange(of: m.glasses) { _, v in prefs.set(v, forKey: "requireGlasses"); g.eye.restart() }
-                }
-                Toggle(L("Mostrar estado en pantalla", "Show status pill"), isOn: $m.hud).onChange(of: m.hud) { _, v in prefs.set(v, forKey: "showHUD") }
-                if !strictMode {
-                    Toggle(L("Mantener Postura activa", "Keep Postura running"), isOn: $m.keep).onChange(of: m.keep) { _, v in shell.setKeepRunning(v) }
-                }
-                Picker(L("Idioma", "Language"), selection: $m.language) {
+                Toggle(L("Mostrar estado en pantalla", "Show status on screen"), isOn: $model.hud)
+                    .onChange(of: model.hud) { _, value in prefs.set(value, forKey: "showHUD") }
+                Picker(L("Idioma", "Language"), selection: $model.language) {
                     Text(L("Sistema", "System")).tag(""); Text("English").tag("en"); Text("Español").tag("es")
-                }.onChange(of: m.language) { _, v in
-                    if v.isEmpty { prefs.removeObject(forKey: "language") } else { prefs.set(v, forKey: "language") }; shell.relaunch()
+                }.onChange(of: model.language) { _, value in
+                    if value.isEmpty { prefs.removeObject(forKey: "language") }
+                    else { prefs.set(value, forKey: "language") }
+                    shell.relaunch()
                 }
-                }
-            } footer: { Text(L("Todo se procesa en este Mac. No se guarda ninguna imagen.", "Everything is processed on this Mac. No images are saved.")) }
+            }
+            .formStyle(.grouped)
+            Button(L("Listo", "Done")) { dismiss() }
+                .keyboardShortcut(.defaultAction)
+                .padding([.trailing, .bottom], 18)
         }
-        .formStyle(.grouped).frame(width: 440).fixedSize(horizontal: false, vertical: true)
+        .frame(width: 410, height: 215)
     }
 }
 
@@ -1088,10 +995,11 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
         let others = NSWorkspace.shared.runningApplications.filter { $0.processIdentifier != me &&
             ($0.bundleIdentifier == agentLabel || $0.bundleIdentifier == "com.sami.postura") }
         if !others.isEmpty { DistributedNotificationCenter.default().postNotificationName(showNote, object: nil, deliverImmediately: true); return false }
-        if !strictMode && !underAgent && keepRunning() && writeAgent() {      // opened by hand: let launchd own the process from now on
+        if !strictMode && !underAgent && writeAgent() {      // opened by hand: let launchd own the process from now on
             prefs.set(true, forKey: "showWindowOnce")
-            sh("launchctl bootout gui/\(getuid())/\(agentLabel); launchctl bootstrap gui/\(getuid()) '\(agentURL.path)'")
-            return false
+            let result = sh("launchctl bootout gui/\(getuid())/\(agentLabel); launchctl bootstrap gui/\(getuid()) '\(agentURL.path)'")
+            if result == 0 { return false }
+            log("login service could not start: \(result)")
         }
         return true
     }
@@ -1105,11 +1013,6 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
                                    "StandardErrorPath": fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/postura.out.log").path]
         try? fm.createDirectory(at: agentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         return plist.write(to: agentURL, atomically: true)
-    }
-    func setKeepRunning(_ on: Bool) {
-        prefs.set(on, forKey: "keepRunning")
-        if on { _ = writeAgent(); log("keep running: on"); relaunch() }
-        else { log("keep running: off"); try? fm.removeItem(at: agentURL); sh("launchctl bootout gui/\(getuid())/\(agentLabel) &") }
     }
     /// Starts a fresh copy (new language, new agent); launchd or the next copy takes over.
     func relaunch() {
@@ -1128,15 +1031,11 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
             let i = NSMenuItem(title: t, action: a, keyEquivalent: key); i.target = self; i.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil); menu.addItem(i)
         }
         add(L("Abrir Postura", "Open Postura"), "macwindow", #selector(show))
-        add(L("Pausar", "Pause coaching"), "pause.fill", #selector(togglePause))
-        menu.items.last?.tag = 17
         menu.addItem(.separator())
         add(L("Buena postura", "Good posture"), "hand.thumbsup", #selector(good))
-        menu.items.last?.tag = 18
         add(L("Mala postura", "Bad posture"), "hand.thumbsdown", #selector(bad))
-        menu.items.last?.tag = 19
         menu.addItem(.separator())
-        add(L("Ajustes…", "Settings…"), "gearshape", #selector(show), ",")
+        add(L("Ajustes…", "Settings…"), "gearshape", #selector(showSettings), ",")
         add(L("Acerca de Postura", "About Postura"), "info.circle", #selector(about))
         it.menu = menu; item = it
         if pythonPath() == nil { setup() } else { g.eye.start() }
@@ -1145,17 +1044,17 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         header.title = model.state
         sub.title = model.detail
-        menu.item(withTag: 17)?.title = model.paused ? L("Reanudar", "Resume coaching") : L("Pausar", "Pause coaching")
-        menu.item(withTag: 18)?.title = model.privacy ? L("Debe mostrar", "Should reveal") : L("Buena postura", "Good posture")
-        menu.item(withTag: 19)?.title = model.privacy ? L("Debe ocultar", "Should hide") : L("Mala postura", "Bad posture")
     }
-    @objc func togglePause() { g.setPaused(!model.paused) }
     @objc func good() { g.teach("good") }
     @objc func bad() { g.teach("bad") }
     @objc func about() { NSApp.activate(ignoringOtherApps: true); NSApp.orderFrontStandardAboutPanel(nil) }
+    @objc func showSettings() {
+        show()
+        model.settingsPresented = true
+    }
     @objc func show() {
         if window == nil {
-            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(m: model) { g.teach($0) }))
+            let w = NSWindow(contentViewController: NSHostingController(rootView: PosturaView(model: model) { g.teach($0) }))
             w.title = "Postura"; w.styleMask = [.titled, .closable, .miniaturizable]; w.isReleasedWhenClosed = false; w.delegate = self
             w.center(); window = w
         }
@@ -1187,29 +1086,24 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
     }
 
     /// Called by Guard.tick(): status for the menu bar icon, the menu and the window.
-    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, secs: Double, left: Int, paused: Bool) {
-        if model.paused != paused { model.paused = paused }
+    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, feedback: String) {
+        if model.feedback != feedback { model.feedback = feedback }
         let (st, d, sym, tint): (String, String, String, Color) = {
             if !model.setup.isEmpty { return (L("Preparando…", "Setting up…"), L("Primera vez: instalando el modelo", "First launch: installing the model"), "arrow.down.circle", .blue) }
-            if paused { return (L("En pausa", "Coaching paused"), L("Reanuda para volver a usar la cámara", "Resume to turn the camera back on"), "pause.circle", .gray) }
             if !camera { return (L("Sin cámara", "No camera"), L("Permítela en Ajustes → Privacidad → Cámara", "Allow it in Settings → Privacy → Camera"), "video.slash", .orange) }
-            if blocked { return (L("Bloqueado", "Blocked"), reason, "figure.fall", .red) }
+            if blocked { return (L("Corrige la postura", "Sit up to continue"), reason, "figure.fall", .red) }
             if level > 0 {
-                let action = privacyEnabled() ? L("Ocultando pantalla", "Covering screen") : L("Corrige la postura", "Fix your posture")
+                let action = L("Corrige la postura", "Adjust your posture")
                 return (action, reason, "figure.fall", .orange)
             }
             if inCall { return (L("En una llamada", "On a call"), L("Solo un aviso suave, nunca bloquea", "Only a gentle hint, never blocks"), "phone", .blue) }
-            if !present { return (L("No te veo", "Not watching"), L("Nadie delante de la cámara", "Nobody in front of the camera"), "eye.slash", .gray) }
-            if privacyEnabled() { return (L("Pantalla visible", "Screen visible"), L("Privacidad activa", "Privacy active"), "eye", .green) }
-            if p >= RELEASE { return (L("Dudoso", "Unsure"), reason, "figure.stand", .yellow) }
-            return (L("Buena postura", "Good posture"), L("Vigilando", "Watching"), "figure.stand", .green)
+            if !present { return (L("Esperando", "Waiting for you"), L("Siéntate donde te vea la cámara", "Sit where the camera can see you"), "eye.slash", .gray) }
+            if p >= RELEASE { return (L("Comprobando la postura", "Checking your posture"), "", "figure.stand", .orange) }
+            return (L("Buena postura", "Good posture"), L("Detección activa", "Posture detection is running"), "figure.stand", .green)
         }()
         if model.state != st { model.state = st }; if model.detail != d { model.detail = d }
         if model.symbol != sym { model.symbol = sym; item?.button?.image = NSImage(systemSymbolName: sym, accessibilityDescription: st) }
         if model.tint != tint { model.tint = tint }
-        if window?.isVisible == true { model.p = p }
-        if model.fixesLeft != left { model.fixesLeft = left }
-        let bt = secs < 60 ? "\(Int(secs)) s" : "\(Int(secs / 60)) min"; if model.blocked != bt { model.blocked = bt }
         let tip = "Postura · \(st)"; if item?.button?.toolTip != tip { item?.button?.toolTip = tip }
     }
 }

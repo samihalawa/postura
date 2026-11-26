@@ -13,10 +13,9 @@ for a in arm64 x86_64; do
 done
 lipo -create build/Postura-arm64 build/Postura-x86_64 -output "$APP/Contents/MacOS/Postura"; rm -f build/Postura-arm64 build/Postura-x86_64
 cp mac/Info.plist "$APP/Contents/"; [ -n "${BUNDLE_ID:-}" ] && /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist"
-cp Resources/AppIcon.icns mac/postura-eye.py mac/postura_privacy.py "$APP/Contents/Resources/"
+cp Resources/AppIcon.icns mac/postura-eye.py "$APP/Contents/Resources/"
 for m in pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task \
-         face_landmarker/face_landmarker/float16/latest/face_landmarker.task \
-         image_embedder/mobilenet_v3_small/float32/latest/mobilenet_v3_small.tflite; do
+         face_landmarker/face_landmarker/float16/latest/face_landmarker.task; do
   f="$CACHE/$(basename "$m")"; [ -s "$f" ] || curl -fsSL "$MODELS/$m" -o "$f"; cp "$f" "$APP/Contents/Resources/models/"
 done
 SFACE=face_recognition_sface_2021dec_int8.onnx
@@ -28,12 +27,6 @@ if ! owner_model_valid "$CACHE/$SFACE"; then
   mv "$CACHE/$SFACE.download" "$CACHE/$SFACE"
 fi
 cp "$CACHE/$SFACE" "$APP/Contents/Resources/models/"
-PERSON_MODEL=efficientdet_lite0_int8.tflite
-if [ ! -s "$CACHE/$PERSON_MODEL" ]; then
-  curl -fLsS --retry 2 "https://huggingface.co/litert-community/MediaPipe-ObjectDetector-EfficientDet-Lite0/resolve/main/$PERSON_MODEL" -o "$CACHE/$PERSON_MODEL.download"
-  mv "$CACHE/$PERSON_MODEL.download" "$CACHE/$PERSON_MODEL"
-fi
-cp "$CACHE/$PERSON_MODEL" "$APP/Contents/Resources/models/"
 SIGN=${SIGN_IDENTITY:--}
 if [ "$SIGN" = - ]; then codesign --force --sign - --entitlements mac/Postura.entitlements "$APP"
 else codesign --force --options runtime --timestamp --entitlements mac/Postura.entitlements --sign "$SIGN" ${SIGN_KEYCHAIN:+--keychain "$SIGN_KEYCHAIN"} "$APP"; fi
