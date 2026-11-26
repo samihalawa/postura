@@ -348,6 +348,109 @@ final class Glow {
     """
 }
 
+/// A single glass lens around the cutout. Only the camera layer changes between frames.
+final class GlassPortrait {
+    let layer = CALayer()
+    private let video = CALayer()
+    private var displayedImage: CGImage?
+
+    init(frame: CGRect, scale: CGFloat) {
+        layer.frame = frame
+        layer.isHidden = true
+        let bounds = layer.bounds
+        let path = Self.outline(in: bounds.insetBy(dx: 3, dy: 3))
+
+        func shape() -> CAShapeLayer {
+            let mask = CAShapeLayer()
+            mask.frame = bounds
+            mask.path = path
+            mask.contentsScale = scale
+            return mask
+        }
+
+        func gradient(_ colors: [NSColor], _ stops: [NSNumber]) -> CAGradientLayer {
+            let glass = CAGradientLayer()
+            glass.frame = bounds
+            glass.contentsScale = scale
+            glass.startPoint = CGPoint(x: 0.14, y: 1)
+            glass.endPoint = CGPoint(x: 0.83, y: 0)
+            glass.colors = colors.map(\.cgColor)
+            glass.locations = stops
+            return glass
+        }
+
+        layer.shadowColor = NSColor.black.cgColor
+        layer.shadowOpacity = 0.32
+        layer.shadowOffset = CGSize(width: 1, height: -9)
+        layer.shadowRadius = 16
+        layer.shadowPath = path
+
+        let tint = gradient([
+            .white.withAlphaComponent(0.30),
+            NSColor(srgbRed: 0.64, green: 0.60, blue: 0.77, alpha: 0.16),
+            NSColor(srgbRed: 0.09, green: 0.07, blue: 0.19, alpha: 0.25),
+            .white.withAlphaComponent(0.13)
+        ], [0, 0.32, 0.68, 1])
+        tint.mask = shape()
+        layer.addSublayer(tint)
+
+        let contents = CALayer()
+        contents.frame = bounds
+        contents.mask = shape()
+        video.frame = bounds.insetBy(dx: bounds.width * 0.10, dy: bounds.height * 0.055)
+        video.contentsGravity = .resizeAspect
+        video.minificationFilter = .trilinear
+        video.transform = CATransform3DMakeScale(-1, 1, 1)
+        contents.addSublayer(video)
+        layer.addSublayer(contents)
+
+        let rim = gradient([
+            .white.withAlphaComponent(0.95),
+            NSColor(srgbRed: 0.80, green: 0.87, blue: 1, alpha: 0.56),
+            .white.withAlphaComponent(0.12),
+            NSColor(srgbRed: 0.92, green: 0.81, blue: 1, alpha: 0.52)
+        ], [0, 0.26, 0.59, 1])
+        let stroke = shape()
+        stroke.fillColor = nil
+        stroke.strokeColor = NSColor.white.cgColor
+        stroke.lineWidth = 1.5
+        rim.mask = stroke
+        layer.addSublayer(rim)
+    }
+
+    /// A wide, asymmetric silhouette keeps the shoulders in view without a circular crop.
+    private static func outline(in rect: CGRect) -> CGPath {
+        func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + x * rect.width, y: rect.minY + y * rect.height)
+        }
+        let path = CGMutablePath()
+        path.move(to: p(0.46, 0.98))
+        path.addCurve(to: p(0.98, 0.54), control1: p(0.76, 1.04), control2: p(0.97, 0.88))
+        path.addCurve(to: p(0.63, 0.025), control1: p(1.00, 0.22), control2: p(0.85, 0.04))
+        path.addCurve(to: p(0.025, 0.44), control1: p(0.30, -0.005), control2: p(0.04, 0.09))
+        path.addCurve(to: p(0.46, 0.98), control1: p(0.007, 0.75), control2: p(0.14, 0.92))
+        path.closeSubpath()
+        return path
+    }
+
+    func show(_ image: CGImage?) {
+        guard displayedImage !== image else { return }
+        let appearing = displayedImage == nil
+        displayedImage = image
+        video.contents = image
+        layer.isHidden = image == nil
+        if image == nil { layer.removeAnimation(forKey: "appear") }
+        if appearing, image != nil {
+            let appear = CABasicAnimation(keyPath: "opacity")
+            appear.fromValue = 0
+            appear.toValue = 1
+            appear.duration = 0.36
+            appear.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(appear, forKey: "appear")
+        }
+    }
+}
+
 /// The warning, after the Apple Intelligence edge glow: light lives on the physical screen edge and floods inward as posture
 /// stays bad, with every boundary feathered (no hard line anywhere). Blur and colour follow one soft, slowly waving front;
 /// correcting posture pulls it back to the edge. Locked: the whole screen is frosted and tinted, the rim breathes.
@@ -355,10 +458,9 @@ final class Liquid {
     static let palette: [SIMD4<Float>] = ["BC82F3", "F5B9EA", "8D9FFF", "FF6778", "FFBA71", "C686FF"].map { h in
         let v = Int(h, radix: 16)!; return SIMD4(Float(v >> 16 & 255) / 255, Float(v >> 8 & 255) / 255, Float(v & 255) / 255, 1) }
     let win: KeyWin, blur = NSVisualEffectView(), glow = Glow(), frost = CALayer()
-    let content = NSView(), portrait = CALayer(), title: Line, why: Line, foot: Line, date: Line, clock: Line, button = NSButton()
+    let content = NSView(), portrait: GlassPortrait, title: Line, why: Line, foot: Line, date: Line, clock: Line, button = NSButton()
     let dayFmt = DateFormatter(), timeFmt = DateFormatter()
     private var buttonSurface: NSView?
-    private var displayedPortrait: CGImage?
     private var lastFrost = -1.0
     let main: Bool; var lastShuffle = -10.0, shown = false, lastClock = -10.0
     var from: [SIMD4<Float>] = [], to: [SIMD4<Float>] = [], size = CGSize.zero, frostOpen = true
@@ -375,19 +477,12 @@ final class Liquid {
         glow.layer.frame = host.bounds; glow.layer.drawableSize = CGSize(width: ceil(W / Glow.scale), height: ceil(H / Glow.scale)); host.layer?.addSublayer(glow.layer)
         content.frame = root.bounds; content.wantsLayer = true; root.addSubview(content)
         let margin = max(24, min(W, H) * 0.045)
-        let portraitWidth = min(276, min(W * 0.27, H * 0.32))
-        let portraitHeight = portraitWidth * 0.75
-        portrait.frame = NSRect(x: W - margin - portraitWidth, y: H - margin - portraitHeight,
-                                width: portraitWidth, height: portraitHeight)
-        portrait.cornerRadius = 24; portrait.masksToBounds = true
-        portrait.contentsGravity = .resizeAspectFill
-        portrait.minificationFilter = .trilinear
-        portrait.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
-        portrait.borderColor = NSColor.white.withAlphaComponent(0.15).cgColor
-        portrait.borderWidth = 1 / win.backingScaleFactor
-        portrait.transform = CATransform3DMakeScale(-1, 1, 1)
-        portrait.isHidden = true
-        if main { content.layer?.addSublayer(portrait) }
+        let portraitWidth = min(320, min(W * 0.30, H * 0.39))
+        let portraitHeight = portraitWidth * 0.76
+        portrait = GlassPortrait(frame: NSRect(x: W - margin - portraitWidth, y: H - margin - portraitHeight,
+                                              width: portraitWidth, height: portraitHeight),
+                                 scale: win.backingScaleFactor)
+        if main { content.layer?.addSublayer(portrait.layer) }
         // the middle belongs to the shape: the time sits in the top left corner, the message in the bottom left one, the action bottom right
         let m = max(40, W * 0.035), tw = W - 2 * m, ts = min(44, H * 0.055), ws = min(19, H * 0.026), cs = min(58, H * 0.067)
         var y = m * 0.9
@@ -486,22 +581,7 @@ final class Liquid {
             lastFrost = t
             drawFrost(p)
         }
-        if main {
-            let visible = shown ? image : nil
-            if displayedPortrait !== visible {
-                if visible == nil { portrait.removeAnimation(forKey: "appear") }
-                let firstImage = displayedPortrait == nil
-                displayedPortrait = visible
-                portrait.contents = visible
-                portrait.isHidden = visible == nil
-                if firstImage, visible != nil {
-                    let appear = CABasicAnimation(keyPath: "opacity")
-                    appear.fromValue = 0; appear.toValue = 1; appear.duration = 0.3
-                    appear.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    portrait.add(appear, forKey: "appear")
-                }
-            }
-        }
+        if main { portrait.show(shown ? image : nil) }
         CATransaction.commit()
         glow.render(p)
         if t - lastClock > 1 { lastClock = t; let today = Date(); date.set(dayFmt.string(from: today)); clock.set(timeFmt.string(from: today)) }
@@ -768,7 +848,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         let image = blocked ? silhouette.image() : nil
         let visualLevel = CoverTiming.visualLevel(level)
         for l in liquids { l.draw(level: visualLevel, t: t, image: image) }
-        ownerPreviewVisible = image != nil && liquids.contains { $0.main && !$0.portrait.isHidden }
+        ownerPreviewVisible = image != nil && liquids.contains { $0.main && !$0.portrait.layer.isHidden }
     }
     func dropLiquids() { liquids.forEach { $0.win.orderOut(nil) }; liquids = [] }
     func setBlocked(_ on: Bool) {

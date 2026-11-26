@@ -99,7 +99,7 @@ flowchart LR
 go to `postura-eye.py`, which runs MediaPipe Pose Landmarker and Face Landmarker and returns a score from 0 (good)
 to 1 (bad) with a reason. The glow and frosted screen ease in and out as you change posture. The cover shows the time, the correction
 and its feedback action. Feedback and Settings buttons use native macOS Liquid Glass where available.
-The cover preview can show a single locally verified person when an existing local face reference matches.
+The cover can show a live cutout inside a glass lens when a single person matches an existing local face reference.
 Otherwise the cover shows the coaching message alone.
 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second).
