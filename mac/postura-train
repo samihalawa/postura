@@ -1,7 +1,42 @@
 #!/bin/bash
-# postura-train bad|good: the last 4 s and the next 6 s of posture measurements become examples.
-# gafas|singafas (glasses|noglasses): the last 4 s teach "with / without glasses". Same as the hotkeys Ctrl-Opt-Cmd-B / G.
-# Only numbers are stored, never images.
-case "$1" in bad|good|gafas|singafas) l=$1;; glasses) l=gafas;; noglasses) l=singafas;; *) echo "usage: postura-train bad|good|glasses|noglasses"; exit 1;; esac
-pgrep -x Postura >/dev/null || { echo "Postura is not running"; exit 1; }
-printf %s "$l" > "$HOME/Library/Application Support/Postura/train"; echo "Learning '$1': hold that posture for 6 s."
+# With no image paths, queue live feedback. With paths, import labeled images locally.
+set -eu
+support="${POSTURA_HOME:-$HOME/Library/Application Support/Postura}"
+label=${1:-}
+case "$label" in
+  hide|reveal)
+    if [ "$#" -eq 1 ]; then mailbox=privacy-feedback; fi ;;
+  background|nearby|close) ;;
+  bad|good|gafas|singafas) mailbox=train ;;
+  glasses) label=gafas; mailbox=train ;;
+  noglasses) label=singafas; mailbox=train ;;
+  *) echo "Usage: postura-train bad|good|glasses|noglasses|hide|reveal" >&2
+     echo "       postura-train hide|reveal|background|nearby|close IMAGE..." >&2
+     exit 2 ;;
+esac
+
+if [ -z "${mailbox:-}" ]; then
+  [ "$#" -gt 1 ] || { echo "Supply at least one calibration image." >&2; exit 2; }
+  installed="$(cd "$(dirname "$0")" && pwd -P)"
+  # The strict installer exposes this script through a symlink in /usr/local/bin.
+  resources="${POSTURA_RESOURCES:-$installed/Postura.app/Contents/Resources}"
+  if [ ! -f "$resources/postura-eye.py" ]; then
+    resources=/usr/local/libexec/postura/Postura.app/Contents/Resources
+  fi
+  python="${POSTURA_PYTHON:-$support/venv/bin/python3}"
+  if [ ! -x "$python" ]; then python=/usr/local/libexec/postura/venv/bin/python3; fi
+  shift
+  POSTURA_HOME="$support" POSTURA_MODELS="$resources/models" exec "$python" "$resources/postura-eye.py" --import-privacy "$label" -- "$@"
+fi
+
+[ "$#" -eq 1 ] || { echo "This live label takes no image paths." >&2; exit 2; }
+pgrep -x Postura >/dev/null || { echo "Postura is not running" >&2; exit 1; }
+request=$(mktemp "$support/feedback.XXXXXX")
+trap 'rm -f "$request"' EXIT
+printf '%s' "$label" > "$request"
+mv -f "$request" "$support/$mailbox"
+if [ "$mailbox" = privacy-feedback ]; then
+  echo "Queued visibility feedback: $label."
+else
+  echo "Learning '$1': hold that posture for 6 s."
+fi

@@ -9,6 +9,7 @@ import SwiftUI
 import AVFoundation
 import Quartz
 import Vision
+import UniformTypeIdentifiers
 import Accelerate
 import Carbon.HIToolbox
 
@@ -17,6 +18,7 @@ let supportDir = ProcessInfo.processInfo.environment["POSTURA_HOME"].map { URL(f
     ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Postura")
 let statusURL = supportDir.appendingPathComponent("status.json")
 let trainURL = supportDir.appendingPathComponent("train")
+let privacyFeedbackURL = supportDir.appendingPathComponent("privacy-feedback")
 let logURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/postura.log")
 try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
 
@@ -36,14 +38,53 @@ func pythonPath() -> String? {
     return ([supportDir.appendingPathComponent("venv/bin/python3").path] + strict).first { fm.isExecutableFile(atPath: $0) }
 }
 let prefs = UserDefaults.standard
+func privacyEnabled() -> Bool { prefs.object(forKey: "privacyMode") as? Bool ?? false }
+func cameraDevices() -> [AVCaptureDevice] {
+    AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external], mediaType: .video, position: .unspecified).devices
+}
 func f2(_ x: Double) -> String { String(format: "%.2f", x) }
 
-// p is smoothed over ~1.2 s. Bad for GRACE s starts the liquid; it takes FILL s to cover the screen; good drains it in DRAIN s.
-let BLOCK = 0.65, RELEASE = 0.40, GRACE = 1.0, FILL = 3.5, DRAIN = 1.0, FIXES_PER_DAY = 5, HOLD = 90.0
+// The display score is smoothed. CoverTiming gates the actual cover on sustained observations.
+let BLOCK = 0.72, RELEASE = 0.40, FIXES_PER_DAY = 5
+
+struct CoverTiming {
+    static let dwell = 5.0, fill = 5.0, clearDelay = 2.0, drain = 2.5
+    private var qualifyingSince: Date?
+    private var clearSince: Date?
+
+    enum Motion: Equatable { case fill, hold, drain }
+
+    mutating func observe(hide: Bool, at now: Date, covering: Bool) {
+        if hide {
+            if qualifyingSince == nil { qualifyingSince = now }
+            clearSince = nil
+        } else {
+            if !covering { qualifyingSince = nil }
+            if clearSince == nil { clearSince = now }
+            if let clearSince, now.timeIntervalSince(clearSince) >= Self.clearDelay {
+                qualifyingSince = nil
+            }
+        }
+    }
+
+    func motion(at now: Date, covering: Bool) -> Motion {
+        if let clearSince {
+            return covering && now.timeIntervalSince(clearSince) < Self.clearDelay ? .hold : .drain
+        }
+        guard let qualifyingSince, now.timeIntervalSince(qualifyingSince) >= Self.dwell else { return covering ? .hold : .drain }
+        return .fill
+    }
+
+    static func visualLevel(_ progress: Double) -> Double {
+        // Ease both ends of the transition while preserving its elapsed time.
+        progress * progress * (3 - 2 * progress)
+    }
+}
 
 final class Eye {
-    var input: FileHandle?, busy = false
-    var onSample: (([String: Any]) -> Void)?
+    private let lock = NSLock()
+    private var input: FileHandle?, busy = false, pending: CVPixelBuffer?
+    var onSample: (([String: Any], CVPixelBuffer?) -> Void)?
     let root = Bundle.main.resourceURL!
     func start() {
         guard let py = pythonPath() else { log("no python yet"); return }
@@ -60,27 +101,45 @@ final class Eye {
             buf.append(chunk)
             while let nl = buf.firstIndex(of: 10) {
                 let line = buf[buf.startIndex..<nl]; buf.removeSubrange(buf.startIndex...nl)
+                self.lock.lock()
+                let frame = self.pending
+                self.pending = nil
                 self.busy = false
-                if let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
-                    if let e = j["error"] { log("eye error \(e)") } else { self.onSample?(j) }
+                self.lock.unlock()
+                if let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any], j["error"] == nil {
+                    self.onSample?(j, frame)
+                } else {
+                    log("eye returned an invalid sample")
+                    self.onSample?([:], frame)
                 }
             }
         }
         p.terminationHandler = { _ in log("eye exited, restarting"); DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.start() } }
-        try? p.run(); input = i.fileHandleForWriting; busy = false; proc = p
+        try? p.run()
+        lock.lock(); input = i.fileHandleForWriting; pending = nil; busy = false; lock.unlock()
+        proc = p
     }
     var proc: Process?
     func restart() { proc?.terminate() }   // the termination handler starts a fresh one with the current settings
-    func send(_ pb: CVPixelBuffer) {
-        guard !busy, let fh = input else { return }
-        autoreleasepool {
-            CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-            let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
-            guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
-            var d = "\(w) \(h)\n".data(using: .utf8)!; d.reserveCapacity(w * h * 4 + 16)
-            for y in 0..<h { d.append(Data(bytesNoCopy: base + y * bpr, count: w * 4, deallocator: .none)) }
-            busy = true
-            do { try fh.write(contentsOf: d) } catch { busy = false }
+    func send(_ pb: CVPixelBuffer, preview: Bool) {
+        lock.lock()
+        guard !busy, let fh = input else { lock.unlock(); return }
+        busy = true; pending = preview ? pb : nil
+        lock.unlock()
+        do {
+            let data = autoreleasepool { () -> Data? in
+                CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+                let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
+                guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+                let header = preview ? "\(w) \(h) owner\n" : "\(w) \(h)\n"
+                var data = Data(header.utf8); data.reserveCapacity(w * h * 4 + 24)
+                for y in 0..<h { data.append(Data(bytesNoCopy: base + y * bpr, count: w * 4, deallocator: .none)) }
+                return data
+            }
+            guard let data else { throw CocoaError(.fileReadUnknown) }
+            try fh.write(contentsOf: data)
+        } catch {
+            lock.lock(); busy = false; pending = nil; lock.unlock()
         }
     }
 }
@@ -117,28 +176,49 @@ func fade(_ v: NSView, _ on: Bool, delay: Double, duration: Double) {
     CATransaction.begin(); CATransaction.setDisableActions(true); l.opacity = on ? 1 : 0; l.add(a, forKey: "fade"); CATransaction.commit()
 }
 
-/// The person in front of the camera as a shape only: a 160x120 signed distance field (negative inside) from Vision's person mask.
-/// their colours without the background, blurred until no feature is left. Nothing is kept.
+/// Only the exact frame that passed identity matching enters the display pipeline.
 final class Silhouette {
+    typealias Preview = (texture: MTLTexture, crop: SIMD3<Float>, opacity: Float)
     private let queue = DispatchQueue(label: "postura.shape", qos: .userInitiated), lock = NSLock()
-    static let pw = 120, ph = 90
-    private var busy = false, wanted = false, goal: [Float]?, art: [Float] = [], ring: [MTLTexture] = [], turn = 0
+    static let pw = 320, ph = 240
+    private var busy = false, epoch = 0, missing: CFTimeInterval?, verified = 0.0
+    private var goal: (pixels: [Float], crop: SIMD3<Float>)?
+    private var ring: [MTLTexture] = [], turn = 0
     private let request: VNGeneratePersonSegmentationRequest = { let r = VNGeneratePersonSegmentationRequest(); r.qualityLevel = .balanced; r.outputPixelFormat = kCVPixelFormatType_OneComponent8; return r }()
-    /// Called by the cover: shapes are only computed while one is on screen.
-    func want(_ on: Bool) { lock.lock(); if on && !wanted { goal = nil; art = [] }; wanted = on; lock.unlock() }
-    func feed(_ pb: CVPixelBuffer) {
-        lock.lock(); let go = wanted && !busy; if go { busy = true }; lock.unlock()
-        guard go else { return }
+
+    func reject() {
+        lock.lock(); defer { lock.unlock() }
+        epoch += 1
+        if missing == nil { missing = CACurrentMediaTime() }
+    }
+
+    func clear() {
+        lock.lock(); defer { lock.unlock() }
+        if busy || goal != nil { epoch += 1 }
+        goal = nil; missing = nil; verified = 0
+    }
+
+    func feed(_ pb: CVPixelBuffer, crop: SIMD3<Float>) {
+        lock.lock()
+        guard !busy else { lock.unlock(); return }
+        busy = true
+        let ticket = epoch
+        let submitted = CACurrentMediaTime()
+        lock.unlock()
         queue.async { [self] in
-            let f = autoreleasepool { () -> [Float]? in
-                guard (try? VNImageRequestHandler(cvPixelBuffer: pb).perform([request])) != nil, let m = request.results?.first?.pixelBuffer else { return nil }
-                guard let a = Silhouette.colours(pb, m) else { return nil }
-                return a
+            let pixels = autoreleasepool { () -> [Float]? in
+                guard (try? VNImageRequestHandler(cvPixelBuffer: pb).perform([request])) != nil,
+                      let mask = request.results?.first?.pixelBuffer else { return nil }
+                return Silhouette.colours(pb, mask)
             }
-            lock.lock(); busy = false; if wanted, let f { goal = f }; lock.unlock()
+            lock.lock(); defer { lock.unlock() }
+            busy = false
+            guard ticket == epoch, let pixels else { return }
+            goal = (pixels, crop)
+            missing = nil; verified = submitted
         }
     }
-    /// RGBA (premultiplied by the person mask), blurred by about a twentieth of the height: warmth, hair and clothes as light, never a face.
+    /// Camera detail premultiplied by the person mask so the room cannot bleed into the portrait.
     static func colours(_ pb: CVPixelBuffer, _ m: CVPixelBuffer) -> [Float]? {
         guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA else { return nil }
         CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -151,23 +231,18 @@ final class Silhouette {
         for y in 0..<ph { let row = b + (y * H / ph) * bpr, mrow = mk + (y * mh / ph) * mb
             for x in 0..<pw { let q = row + (x * W / pw) * 4, a = Float(mrow[x * mw / pw]) / 255
                 c[y * pw + x] = SIMD4(Float(q[2]), Float(q[1]), Float(q[0]), 255) * (a / 255) } }
-        let r = 4
-        for _ in 0..<3 { for (A, B, sa, sb) in [(pw, ph, 1, pw), (ph, pw, pw, 1)] {
-            let g = c
-            for y in 0..<B { for x in 0..<A {
-                var sum = SIMD4<Float>.zero; for i in -r...r { sum += g[y * sb + min(A - 1, max(0, x + i)) * sa] }
-                c[y * sb + x * sa] = sum / Float(2 * r + 1) } }
-        } }
         return c.withUnsafeBufferPointer { $0.withMemoryRebound(to: Float.self) { Array($0) } }
     }
     /// Once per animation frame; nil while there is no shape to show.
-    func texture() -> MTLTexture? {
-        lock.lock(); let g = goal; lock.unlock()
-        guard let g, let dev = Glow.gpu?.dev else { return nil }
-        func drift(_ c: inout [Float], _ to: [Float], _ k: Float) {
-            if c.count != to.count { c = to } else { var k = k; vDSP_vintb(c, 1, to, 1, &k, &c, 1, vDSP_Length(to.count)) }
-        }
-        drift(&art, g, 0.07)               // slow, so it trails like light through glass
+    func texture() -> Preview? {
+        let now = CACurrentMediaTime()
+        lock.lock()
+        let g = goal
+        let fadeAt = min(missing ?? .infinity, verified + 0.65)
+        let opacity = Float(max(0, min(1, 1 - (now - fadeAt) / 0.25)))
+        if opacity == 0 { goal = nil }
+        lock.unlock()
+        guard opacity > 0, let g, let dev = Glow.gpu?.dev else { return nil }
         if ring.isEmpty {
             func make(_ f: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture? {
                 let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false); d.usage = .shaderRead; return dev.makeTexture(descriptor: d)
@@ -176,28 +251,11 @@ final class Silhouette {
         }
         guard !ring.isEmpty else { return nil }
         turn = (turn + 1) % ring.count
-        ring[turn].replace(region: MTLRegionMake2D(0, 0, Silhouette.pw, Silhouette.ph), mipmapLevel: 0, withBytes: art, bytesPerRow: Silhouette.pw * 16)
-        return ring[turn]
+        ring[turn].replace(region: MTLRegionMake2D(0, 0, Silhouette.pw, Silhouette.ph), mipmapLevel: 0, withBytes: g.pixels, bytesPerRow: Silhouette.pw * 16)
+        return (ring[turn], g.crop, opacity)
     }
 }
 let silhouette = Silhouette()
-
-/// When the portrait appears. It comes out of the light like a slow breath, stays, and goes back; then a long pause.
-struct Apparition {
-    static let PERIOD = 30.0, LIFE = 21.0
-    var person: Float = 0, aura: Float = 0, rings: Float = 0, spread: Float = 0, angle: Float = 0
-    var alive = false
-    init(_ t: Double) {                                                                  // t = seconds since the message appeared
-        guard t >= 0.8 else { return }
-        let n = Int((t - 0.8) / Apparition.PERIOD), u = (t - 0.8) - Double(n) * Apparition.PERIOD
-        guard u < Apparition.LIFE else { return }
-        func s(_ a: Double, _ b: Double) -> Float { let x = Float(min(1, max(0, (u - a) / (b - a)))); return x * x * x * (x * (6 * x - 15) + 10) }
-        let v = sin(Double(n + 1) * 12.9898) * 43758.5453
-        alive = true; angle = Float(v - floor(v)) * 2 * .pi
-        person = s(0.8, 6.5) * (1 - s(13, 19)); aura = s(2.5, 9) * (1 - s(14, Apparition.LIFE))
-        rings = s(0, 6) * (1 - s(14.5, Apparition.LIFE)); spread = Float(min(1, u / Apparition.LIFE))
-    }
-}
 
 /// The light of the warning, drawn in one small Metal pass (at half the points, 30 fps) and stretched. Everything in it is soft, so it
 /// looks the same as the former stack of full-resolution blurred layers, which cost the window server enough to slow the whole Mac.
@@ -207,9 +265,8 @@ final class Glow {
         var front = SIMD4<Float>(0, 0, 0, 1)          // half-width, half-height, wave amplitude, feather
         var rim = SIMD4<Float>(0, 1, 1, 0)            // wave amplitude, rim width factor, front width factor, time
         var opacity = SIMD4<Float>(0, 0, 0, 0)        // tint, colour wash, rim, front
-        var frame = SIMD4<Float>(0, 0, 1, 1)          // where the camera frame lies: left, bottom, width, height
-        var shapeA = SIMD4<Float>(0, 0, 0, 0)         // presence, unused, threads, unused
-        var shapeB = SIMD4<Float>(0, 0, 0, 0)         // direction the light comes from
+        var frame = SIMD4<Float>(0, 0, 1, 1)          // camera circle: screen center x, center y, radius
+        var shapeA = SIMD4<Float>(0, 0, 0, 0)         // camera opacity, source center x/y, crop height
         var stops: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = (.zero, .zero, .zero, .zero, .zero, .zero, .zero)
     }
     static let scale: CGFloat = 2
@@ -259,7 +316,7 @@ final class Glow {
     static let shader = """
     #include <metal_stdlib>
     using namespace metal;
-    struct P { float2 size, pad; float4 front, rim, op, frame, sa, sb; float4 st[7]; };
+    struct P { float2 size, pad; float4 front, rim, op, frame, sa; float4 st[7]; };
     struct V { float4 pos [[position]]; float2 uv; };
     vertex V v(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V o; o.pos = float4(q * 2 - 1, 0, 1); o.uv = q; return o; }
     static float cdf(float z) { return 1 / (1 + exp(-1.702 * clamp(z, -20.0, 20.0))); }
@@ -280,12 +337,6 @@ final class Glow {
         return c;
     }
     static float4 at(texture2d<float> s, int2 i) { i = clamp(i, int2(0), int2(s.get_width() - 1, s.get_height() - 1)); return s.read(uint2(i)); }
-    static float2 flow(float2 c, float t) {                                         // slow, smooth currents
-        float2 a = c * 3.1 + float2(0.11, -0.16) * t;
-        float2 v = float2(sin(a.y * 2.1 + 1.3 * sin(a.x * 1.3 + 0.07 * t)), cos(a.x * 1.9 + 1.2 * sin(a.y * 1.5 - 0.06 * t)));
-        float2 b = c.yx * 6.7 + v * 0.8 + 0.09 * t;
-        return v * 0.7 + 0.3 * float2(sin(b.x), cos(b.y));
-    }
     static float4 field(texture2d<float> s, float2 uv) {                             // bilinear by hand: 32-bit floats are not filterable everywhere
         float2 x = uv * float2(s.get_width(), s.get_height()) - 0.5, fx = fract(x); int2 i = int2(floor(x));
         return mix(mix(at(s, i), at(s, i + int2(1, 0)), fx.x), mix(at(s, i + int2(0, 1)), at(s, i + int2(1, 1)), fx.x), fx.y);
@@ -309,28 +360,26 @@ final class Glow {
         keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 4 * k, 2); keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 10 * k, 6);
         keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 22 * k, 18); keep *= 1 - stroke(q, e, 0.04, 4, ra, rt, 44 * k, 52);
         float rim = (1 - keep) * p.op.z;
-        float4 o = float4(float3(0.07, 0.06, 0.16), 1) * p.op.x;                       // premultiplied, back to front
+        float4 o = float4(float3(0.21, 0.17, 0.29), 1) * p.op.x;                       // premultiplied, back to front
         float w = p.op.y * region; o = float4(wash, 1) * w + o * (1 - w);
         o = float4(light, 1) * rim + o * (1 - rim);
         o = float4(light, 1) * front + o * (1 - front);
-        if (p.sa.x + p.sa.z > 0.001) {                                                  // silk: threads of light over the whole screen that swell where someone sits
-            float2 c = (in.uv * p.size - p.frame.xy) / p.frame.zw, u = in.uv;           // c: 0..1 in the camera frame, y up
-            float2 cur = flow(c * 0.7, t * 0.8), m = float2(1 - c.x, 1 - c.y) + cur * 0.025;      // like a mirror, through moving water
-            float fr = smoothstep(0.0, 0.22, c.x) * (1 - smoothstep(0.78, 1.0, c.x)) * (1 - smoothstep(0.70, 1.02, c.y));
-            float4 a = field(art, m); float here = smoothstep(0.0, 1.0, a.a) * fr * p.sa.x;
-            float3 own = a.rgb / max(a.a, 0.05); float tone = saturate(dot(own, float3(0.299, 0.587, 0.114)) * 1.15);
-            float swell = here * (0.085 + 0.075 * tone);                                // the body lifts the threads, its lighter parts a little more
-            float wave = 0.020 * sin(u.x * 4.2 + t * 0.16) + 0.013 * sin(u.x * 9.1 - t * 0.11 + u.y * 5) + 0.012 * cur.y;
-            float y = u.y - swell + wave, v = y * 38, w = fwidth(v), dist = abs(fract(v) - 0.5), id = floor(v);
-            float soft = 0.10 + 0.10 * here;
-            float strand = exp(-pow(dist / (soft + w * 0.6), 2.0)) * (1 - smoothstep(0.5, 1.4, w));
-            float shimmer = 0.65 + 0.35 * sin(id * 1.7 + u.x * 5 - t * 0.35);           // light running slowly along each thread, each at its own time
-            float rim_ = smoothstep(0.02, 0.16, u.x) * (1 - smoothstep(0.84, 0.98, u.x)) * smoothstep(0.05, 0.22, u.y) * (1 - smoothstep(0.74, 0.96, u.y));
-            float3 hue = around(0.45 * u.x + 0.35 * u.y + 0.10 * cur.x + 0.30 * tone * here + t / 80, p);
-            float3 veil = mix(hue, own, 0.30) * here * (0.10 + 0.40 * tone);            // their warmth, very softly, behind the threads
-            float3 light_ = veil + mix(hue, float3(1), 0.30 + 0.35 * here * tone) * strand * shimmer * (0.11 * p.sa.z + here * (0.22 + 0.75 * tone));
-            light_ = 1 - exp(-light_ * rim_ * 1.15);
-            o.rgb = o.rgb + light_ * (1 - o.rgb * 0.8); o.a += (1 - o.a) * max(light_.r, max(light_.g, light_.b));
+        if (p.sa.x > 0.001) {
+            float2 circle = (in.uv * p.size - p.frame.xy) / p.frame.z;
+            float r = length(circle);
+            if (r < 1.03) {
+                float2 camera = p.sa.yz + float2(-circle.x * 0.75, -circle.y) * p.sa.w * 0.5;
+                if (all(camera > 0) && all(camera < 1)) {
+                    float4 raw = field(art, camera);
+                    float matte = smoothstep(0.67, 0.94, raw.a);
+                    float clip = 1 - smoothstep(0.88, 1.0, r);
+                    float frameEdge = smoothstep(0, 0.045, min(min(camera.x, camera.y), min(1 - camera.x, 1 - camera.y)));
+                    float3 original = saturate(raw.rgb / max(raw.a, 0.02));
+                    o = mix(o, float4(original, 1), matte * clip * frameEdge * p.sa.x);
+                }
+                float ring = (1 - smoothstep(0.01, 0.045, abs(r - 0.98))) * p.sa.x * 0.55;
+                o = mix(o, float4(mix(light, float3(0.94, 0.86, 1), 0.26), 1), ring);
+            }
         }
         return o;
     }
@@ -346,7 +395,7 @@ final class Liquid {
     let win: KeyWin, blur = NSVisualEffectView(), glow = Glow(), frost = CALayer()
     let content = NSView(), title: Line, why: Line, foot: Line, date: Line, clock: Line, button = NSButton()
     let dayFmt = DateFormatter(), timeFmt = DateFormatter()
-    let main: Bool; var lastShuffle = -10.0, shown = false, shownAt = 0.0, lastClock = -10.0
+    let main: Bool; var lastShuffle = -10.0, shown = false, lastClock = -10.0
     var from: [SIMD4<Float>] = [], to: [SIMD4<Float>] = [], size = CGSize.zero, frostOpen = true
     init(frame f: NSRect, main: Bool, target: AnyObject, action: Selector) {
         let W = f.width, H = f.height; size = f.size; self.main = main
@@ -409,12 +458,12 @@ final class Liquid {
         frost.contents = m
     }
     /// The message fades in once, top to bottom, and out together.
-    func reveal(_ on: Bool, t: Double) {
-        guard on != shown else { return }; shown = on; if on { shownAt = t }
+    func reveal(_ on: Bool) {
+        guard on != shown else { return }; shown = on
         for (i, v) in [clock, date, title, why, foot].enumerated() { fade(v, on, delay: on ? 0.25 * Double(i) : 0, duration: on ? 2.0 : 0.4) }
         if button.superview != nil { fade(button, on && button.isEnabled, delay: on ? 0.9 : 0, duration: on ? 0.8 : 0.3) }
     }
-    func draw(level: Double, t: Double, shape: MTLTexture?) {
+    func draw(level: Double, t: Double, shape: Silhouette.Preview?) {
         if t - lastShuffle > 9 { shuffle(t) }
         let bw = size.width, bh = size.height, short = min(bw, bh)
         let s = CGFloat(min(1, max(0, level))), ease = s * s * (3 - 2 * s), breathe = CGFloat(0.5 + 0.5 * sin(0.55 * t))
@@ -426,22 +475,22 @@ final class Liquid {
         var p = Glow.Params()
         p.size = SIMD2(Float(bw), Float(bh)); p.front = SIMD4(Float(a), Float(b), Float(max(0, min(14 + 30 * ease, 0.12 * min(a, b)))), Float(soft))
         p.rim = SIMD4(Float(4 + 8 * breathe * (0.4 + 0.6 * locked)), Float(0.7 + 0.45 * ease + 0.2 * locked * breathe), Float(0.8 + 0.4 * ease), Float(t))
-        p.opacity = SIMD4(Float(0.82 * locked),                                      // tint: depth behind the message, not a grey dim
+        p.opacity = SIMD4(Float(0.92 * locked),                                      // tint: depth behind the message, not a grey dim
                           Float(fade * (0.25 + 0.35 * ease - 0.30 * locked + 0.06 * locked * breathe)),
                           Float(fade * min(1, 0.6 + 2.5 * s) * (0.85 + 0.15 * breathe)),
                           Float(0.45 * min(1, 4 * s) * (1 - locked)))                // a faint luminous edge on the front, never a line
-        let fh = bh * 1.0, fw = fh * 4 / 3; p.frame = SIMD4(Float((bw - fw) / 2), 0, Float(fw), Float(fh))
-        if shown, shape != nil {
-            let a = Apparition(t - shownAt)
-            p.shapeA = SIMD4(a.person, a.aura, a.rings, a.spread); p.shapeB = SIMD4(a.angle, 0, 0, 0)
+        if main, shown, let shape {
+            let radius = min(66, max(42, short * 0.061))
+            p.frame = SIMD4(Float(bw - radius - 25), Float(bh - radius - 25), Float(radius), 0)
+            p.shapeA = SIMD4(shape.opacity, shape.crop.x, shape.crop.y, shape.crop.z)
         }
         let c = stops(t); withUnsafeMutableBytes(of: &p.stops) { $0.copyBytes(from: c.withUnsafeBytes { Array($0) }) }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         blur.alphaValue = fade; drawFrost(p)
         CATransaction.commit()
-        glow.render(p, shape)
+        glow.render(p, shape?.texture)
         if t - lastClock > 1 { lastClock = t; let today = Date(); date.set(dayFmt.string(from: today)); clock.set(timeFmt.string(from: today)) }
-        reveal(level >= (shown ? 0.85 : 0.97), t: t)
+        reveal(level >= (shown ? 0.85 : 0.97))
     }
     /// With no corrections left there is no dead button, only the line of text that says so.
     func setButton(_ s: String, enabled: Bool) {
@@ -451,13 +500,26 @@ final class Liquid {
     }
 }
 
-final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
+final class CameraReceiver: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    var onFrame: ((CVPixelBuffer) -> Void)?
+    func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if let buffer = CMSampleBufferGetImageBuffer(sample) { onFrame?(buffer) }
+    }
+}
+
+final class Guard: NSObject, NSApplicationDelegate {
     let session = AVCaptureSession(), queue = DispatchQueue(label: "postura.camera"), eye = Eye()
-    var lastFrame = Date.distantPast, lastProcessed = Date.distantPast, lastSampleAt = Date.distantPast, lastSeen = Date.distantPast
-    var pBar = 0.0, badSince: Date?, graceUntil = Date.distantPast, lastFaceAt = Date.distantPast
+    let receiver = CameraReceiver(), videoOutput = AVCaptureVideoDataOutput()
+    var lastFrame = Date.distantPast, lastProcessed = Date.distantPast, lastSampleAt = Date.distantPast
+    var pBar = 0.0, graceUntil = Date.distantPast
     var level = 0.0, blocked = false, releasing = false, lastAnim = Date(), t0 = Date()
-    var present = false, dodging = false, training = "", reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
+    var present = false, training = "", reason = "", reasonKind = "", note = "", noteUntil = Date.distantPast, lastSample: [String: Any] = [:]
+    var cameraName = ""
+    var coverTiming = CoverTiming()
+    var lastCameraRestart = Date.distantPast
+    var paused = prefs.bool(forKey: "coachingPaused")
     var camera = true, inCall = false, locked = false, poweringOff = false
+    private var ownerPreviewVisible = false
     var screenFrames: [NSRect] = [], liquids: [Liquid] = [], hud: NSWindow?, hudText: NSTextField?, keyMonitor: Any?
     var message: (String, String)?, messageAt = Date.distantPast, pendingKey = "", pendingAt = Date.distantPast
     var blockedSeconds = 0.0, raisedAt = Date.distantPast, wroteAt = Date.distantPast, wroteMode = ""
@@ -466,7 +528,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { _ in self.poweringOff = true }
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {   // lid opened / display woke: the camera stops while asleep
-            ws.addObserver(forName: name, object: nil, queue: .main) { _ in log("wake"); self.reset("wake"); self.restartCamera() }
+            ws.addObserver(forName: name, object: nil, queue: .main) { _ in log("wake"); self.revealScreen("wake"); self.restartCamera() }
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
             // locking hides the Dock and the menu bar, which posts this too: only a real change of displays rebuilds the cover
@@ -474,9 +536,24 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         }
         NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { _ in log("camera runtime error"); self.restartCamera() }
         log("start")
-        eye.onSample = { s in DispatchQueue.main.async { self.handle(s, Date()) } }
+        eye.onSample = { s, frame in
+            DispatchQueue.main.async {
+                guard !self.paused else { return }
+                if let frame {
+                    if self.blocked, let crop = s["ownerCrop"] as? [Double], crop.count == 3,
+                       crop.allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
+                        silhouette.feed(frame, crop: SIMD3(Float(crop[0]), Float(crop[1]), Float(crop[2])))
+                    } else {
+                        silhouette.reject()
+                    }
+                }
+                if !s.isEmpty { self.handle(s, Date()) }
+                else { self.revealScreen("camera analysis failed") }
+            }
+        }
         shell.start()
-        AVCaptureDevice.requestAccess(for: .video) { ok in DispatchQueue.main.async { if ok { self.startCamera() } else { self.camera = false; log("camera denied") } } }
+        if !paused { requestCamera() }
+        if !underAgent && !strictMode { shell.show() }
         every(1.0 / 30) { self.animate() }
         every(0.5) { self.tick() }
         every(10) { self.checkCall() }
@@ -488,7 +565,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         }
     }
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool { shell.show(); return false }
-    func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply { poweringOff ? .terminateNow : .terminateCancel }
+    func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply { poweringOff || (!strictMode && !blocked) ? .terminateNow : .terminateCancel }
 
     // Run-loop timers once stopped for good while the screen was covered (24 Nov 2026) although the main queue kept running, so
     // everything periodic runs on the main queue. If the animation still stops, the watchdog ends the process: that removes the
@@ -511,63 +588,153 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     }
 
     // MARK: camera
-    func startCamera() {
-        let devs = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external], mediaType: .video, position: .unspecified).devices
-        guard let dev = devs.first(where: { !$0.localizedName.contains("Virtual") }) ?? devs.first,
-              let input = try? AVCaptureDeviceInput(device: dev) else { camera = false; log("no camera"); return }
-        session.sessionPreset = .vga640x480
-        if session.canAddInput(input) { session.addInput(input) }
-        let out = AVCaptureVideoDataOutput(); out.alwaysDiscardsLateVideoFrames = true
-        out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        out.setSampleBufferDelegate(self, queue: queue)
-        if session.canAddOutput(out) { session.addOutput(out) }
-        // 15 frames/s: macOS runs its video effects (portrait, studio light) on every frame, twice as many as anything here needs
-        queue.async {
-            self.session.startRunning()
-            if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && $0.maxFrameRate >= 15 }), (try? dev.lockForConfiguration()) != nil {
-                dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15); dev.unlockForConfiguration()
+    func requestCamera() {
+        let asking = AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined
+        if asking {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        AVCaptureDevice.requestAccess(for: .video) { allowed in
+            DispatchQueue.main.async {
+                guard !self.paused else { return }
+                if allowed { self.startCamera() }
+                else { self.camera = false; log("camera permission denied") }
             }
         }
-        camera = true; log("camera \(dev.localizedName)")
+    }
+    func startCamera() {
+        let devices = cameraDevices()
+        let selected = ProcessInfo.processInfo.environment["POSTURA_CAMERA"] ?? prefs.string(forKey: "cameraDevice") ?? ""
+        let device = selected.isEmpty
+            ? devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? devices.first
+            : devices.first(where: { $0.uniqueID == selected || $0.localizedName == selected })
+        guard let dev = device, let input = try? AVCaptureDeviceInput(device: dev) else {
+            camera = false; log("camera unavailable: \(selected)"); return
+        }
+        let out = videoOutput
+        out.alwaysDiscardsLateVideoFrames = true
+        out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        session.beginConfiguration()
+        if dev.deviceType == .builtInWideAngleCamera, session.canSetSessionPreset(.vga640x480) {
+            session.sessionPreset = .vga640x480
+        }
+        guard session.canAddInput(input) else {
+            session.commitConfiguration()
+            camera = false; log("could not configure camera input: \(dev.localizedName)"); return
+        }
+        session.addInput(input)
+        receiver.onFrame = { [weak self] in self?.cameraFrame($0) }
+        out.setSampleBufferDelegate(receiver, queue: queue)
+        guard session.canAddOutput(out) else {
+            session.removeInput(input)
+            session.commitConfiguration()
+            camera = false; log("could not configure camera output: \(dev.localizedName)"); return
+        }
+        session.addOutput(out)
+        session.commitConfiguration()
+        lastCameraRestart = Date()
+        camera = true; cameraName = dev.localizedName; log("camera \(dev.localizedName)")
+        queue.async {
+            self.session.startRunning()
+            if !self.session.isRunning { log("camera session failed to start") }
+        }
     }
     func restartCamera() {
-        guard camera else { return }
-        queue.async { if self.session.inputs.isEmpty { DispatchQueue.main.async { self.startCamera() } } else if !self.session.isRunning { self.session.startRunning() } }
+        guard !paused, camera, Date().timeIntervalSince(lastCameraRestart) >= 5 else { return }
+        lastCameraRestart = Date()
+        queue.async {
+            if self.session.inputs.isEmpty { DispatchQueue.main.async { self.startCamera() }; return }
+            if self.session.isRunning { self.session.stopRunning() }
+            self.session.startRunning()
+        }
     }
-    func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
+    func setPaused(_ value: Bool) {
+        guard value != paused else { return }
+        paused = value
+        prefs.set(value, forKey: "coachingPaused")
+        revealScreen(value ? "coaching paused" : "coaching resumed")
+        if value {
+            queue.async { if self.session.isRunning { self.session.stopRunning() } }
+        } else if session.inputs.isEmpty {
+            requestCamera()
+        } else {
+            lastCameraRestart = Date.distantPast
+            restartCamera()
+        }
+        tick()
+    }
+    func cameraFrame(_ pb: CVPixelBuffer) {
         let now = Date()  // 2.5 frames/s while all is well, 6/s while something looks wrong
-        if level > 0.85, let live = CMSampleBufferGetImageBuffer(sb) { silhouette.feed(live) }
-        guard now.timeIntervalSince(lastProcessed) > (level == 0 && pBar < RELEASE && training.isEmpty ? 0.4 : 0.16), let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+        let interval = privacyEnabled() ? 0.18 : (level == 0 && pBar < RELEASE && training.isEmpty ? 0.4 : 0.16)
+        guard now.timeIntervalSince(lastProcessed) > interval else { return }
+        if lastProcessed == .distantPast { log("camera delivering frames") }
         lastProcessed = now
-        eye.send(pb)
+        eye.send(pb, preview: level >= 0.97)
     }
 
     // MARK: judgement -> smoothed p
-    func reset(_ why: String) { if (level > 0 || blocked) && pBar > 0 { log("clear: \(why)") }; pBar = 0; badSince = nil }
+    func reset(_ why: String) { if (level > 0 || blocked) && pBar > 0 { log("clear: \(why)") }; pBar = 0 }
+    func revealScreen(_ why: String) {
+        reset(why)
+        coverTiming = CoverTiming()
+        present = false; releasing = false; level = 0
+        reason = ""; reasonKind = ""; message = nil
+        if blocked { setBlocked(false) }
+        if !liquids.isEmpty { dropLiquids() }
+        silhouette.clear(); ownerPreviewVisible = false
+    }
     func handle(_ s: [String: Any], _ now: Date) {
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
         lastFrame = now; lastSampleAt = now; lastSample = s
         training = s["training"] as? String ?? ""
-        let seen = (s["face"] as? Bool) == true, person = (s["person"] as? Bool) == true
-        if seen || person { lastSeen = now }
-        present = now.timeIntervalSince(lastSeen) < 2.5   // a missed frame or two is not "gone": hold the current state
-        // Once a warning is under way, leaning out of view, hiding the face or turning away never clears it: it keeps
-        // counting as bad until you come back and sit well, or are really gone for HOLD seconds.
-        let warning = level > 0 || pBar >= BLOCK, unjudged = (s["kind"] as? String) == "unjudged"
-        dodging = warning && (!seen || unjudged) && now.timeIntervalSince(lastFaceAt) < HOLD
-        if seen && !unjudged { lastFaceAt = now }
-        if dodging {
-            pBar += (1 - exp(-dt / 1.2)) * (1 - pBar); badSince = badSince ?? now; reasonKind = "hidden"
-            reason = L("no te veo", "can't see you"); return
+        if let count = s["privacyFeedback"] as? Int {
+            flash(count > 0 ? L("Ejemplo guardado", "Feedback learned")
+                            : L("Se necesita una persona cerca", "Feedback needs one nearby person"))
         }
-        if !present { reset("nobody in frame"); return }
-        // a "person" without a face (a coat on a chair, a back, a hand) must not keep the cover up for ever: after HOLD it counts as gone
-        if warning && !seen && now.timeIntervalSince(lastFaceAt) >= HOLD { reset("no face for \(Int(HOLD)) s"); return }
-        if !training.isEmpty || now < graceUntil { pBar = 0; badSince = nil; return }
-        if !seen { return }
-        let p = (s["p"] as? NSNumber)?.doubleValue ?? 0
-        pBar += (1 - exp(-dt / 1.2)) * (p - pBar)
-        if pBar >= BLOCK { badSince = badSince ?? now; reason = s["why"] as? String ?? ""; reasonKind = s["kind"] as? String ?? "" } else if pBar < RELEASE { badSince = nil }
+        guard s["person"] as? Bool == true else { revealScreen("nobody in frame"); return }
+        if privacyEnabled() {
+            guard let verdict = s["privacy"] as? [String: Any] else { revealScreen("missing visibility result"); return }
+            let classification = verdict["reason"] as? String ?? "empty"
+            if classification == "empty" { revealScreen("no measurable person"); return }
+            present = true; reasonKind = "privacy"
+            let hide = verdict["hide"] as? Bool == true
+            if locked { coverTiming = CoverTiming() }
+            else if !releasing { coverTiming.observe(hide: hide, at: now, covering: level > 0) }
+            pBar = hide ? 1 : 0
+            switch classification {
+            case "close": reason = L("persona muy cerca", "person close to the screen")
+            case "gaze": reason = L("mirada sostenida", "sustained attention")
+            case "still": reason = L("persona quieta cerca", "person stationary nearby")
+            case "learned": reason = L("como tus ejemplos", "matches your examples")
+            default: if level <= 0 { reason = "" }
+            }
+            return
+        }
+        present = true
+        if s["postureUnjudged"] as? String == "far" { revealScreen("person in background"); return }
+        if locked || !training.isEmpty || now < graceUntil {
+            reset("posture correction")
+            coverTiming = CoverTiming()
+            return
+        }
+        let judged = (s["face"] as? Bool) == true && (s["kind"] as? String) != "unjudged"
+        let score = judged ? (s["p"] as? NSNumber)?.doubleValue ?? 0 : 0
+        pBar += (1 - exp(-dt / 1.2)) * (score - pBar)
+
+        // Ambiguous posture can never start a cover. Once full, wait for a
+        // clearly corrected posture or an empty frame before uncovering.
+        let shouldCover = score >= BLOCK || (blocked && (!judged || score > RELEASE))
+        if !releasing { coverTiming.observe(hide: shouldCover, at: now, covering: level > 0) }
+        if score >= BLOCK {
+            reason = s["why"] as? String ?? ""
+            reasonKind = s["kind"] as? String ?? ""
+        } else if blocked && !judged {
+            reason = L("postura fuera de vista", "posture out of view")
+            reasonKind = "hidden"
+        } else if judged && reasonKind == "hidden" {
+            reason = s["why"] as? String ?? ""
+            reasonKind = s["kind"] as? String ?? ""
+        }
     }
     func brief(_ s: [String: Any]) -> String {
         ["pitch", "roll", "yaw", "neck", "fwd", "noseY", "shY", "shTilt", "dist", "glasses", "faces"].compactMap { k in (s[k] as? NSNumber).map { "\(k)=\(f2($0.doubleValue))" } }.joined(separator: " ")
@@ -577,26 +744,32 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
     func animate() {
         let now = Date(), dt = min(0.2, now.timeIntervalSince(lastAnim)); lastAnim = now
         beatLock.lock(); beat = ProcessInfo.processInfo.systemUptime; beatLock.unlock()
-        let bad = (present || dodging) && !locked && pBar >= BLOCK && badSince != nil && now.timeIntervalSince(badSince!) >= GRACE && now >= graceUntil
-        let good = (!present && !dodging) || locked || pBar < RELEASE || now < graceUntil
-        let cap = inCall ? 0.22 : 1.0     // on a call only a thin edge glow shows, it never blocks
-        // a released cover always drains completely: wavering at the threshold must not lock, unlock and lock again
-        if releasing { level = max(0, level - dt / DRAIN); if level <= 0 { releasing = false } }
-        else if bad { level = min(cap, level + dt / FILL) } else if good { level = max(0, level - dt / DRAIN) }
-        if level > cap { level = max(cap, level - dt / DRAIN) }
+        let motion = coverTiming.motion(at: now, covering: level > 0)
+        let good = paused || motion == .drain || locked || (!privacyEnabled() && (!training.isEmpty || now < graceUntil))
+        let cap = inCall ? 0.22 : 1.0
+        // Finish an uncover before accumulating a new sustained verdict.
+        if good && level > 0 { releasing = true; coverTiming = CoverTiming() }
+        if releasing {
+            level = max(0, level - dt / CoverTiming.drain)
+            if level <= 0 { releasing = false }
+        } else if level > cap {
+            level = max(cap, level - dt / CoverTiming.drain)
+        } else if motion == .fill && !good {
+            level = min(cap, level + dt / CoverTiming.fill)
+        }
         if level >= 1, !blocked { setBlocked(true) } else if level < 0.97, blocked { releasing = true; setBlocked(false) }
         if blocked { blockedSeconds += dt }
-        if level <= 0 { silhouette.want(false); message = nil; if !liquids.isEmpty { dropLiquids() }; return }
+        if level <= 0 { silhouette.clear(); ownerPreviewVisible = false; message = nil; if !liquids.isEmpty { dropLiquids() }; return }
         if liquids.isEmpty {
             screenFrames = NSScreen.screens.map(\.frame)
             liquids = NSScreen.screens.map { Liquid(frame: $0.frame, main: $0 == NSScreen.main || NSScreen.screens.count == 1, target: self, action: #selector(fixClicked)) }
             liquids.forEach { $0.win.ignoresMouseEvents = !blocked; $0.win.orderFrontRegardless() }
         }
         let t = now.timeIntervalSince(t0)
-        let showing = liquids.contains { $0.shown && Apparition(t - $0.shownAt + 0.6).alive }
-        silhouette.want(showing)
-        let shape = showing ? silhouette.texture() : nil
-        for l in liquids { l.draw(level: level, t: t, shape: shape) }
+        let shape = silhouette.texture()
+        ownerPreviewVisible = shape != nil && liquids.contains { $0.main && $0.shown }
+        let visualLevel = CoverTiming.visualLevel(level)
+        for l in liquids { l.draw(level: visualLevel, t: t, shape: shape) }
     }
     func dropLiquids() { liquids.forEach { $0.win.orderOut(nil) }; liquids = [] }
     func setBlocked(_ on: Bool) {
@@ -608,16 +781,58 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             NSApp.presentationOptions = [.hideDock, .hideMenuBar, .disableProcessSwitching, .disableForceQuit, .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
         } else {
             log("ok p=\(f2(pBar)) \(brief(lastSample))")
-            NSApp.presentationOptions = []; NSApp.setActivationPolicy(.accessory)
+            NSApp.presentationOptions = []
         }
     }
 
     // MARK: teaching and corrections
     // "good"/"bad": the last 4 s and next 6 s become posture examples (postura-eye.py). "good" while it says bad is a
     // correction: it also drains the liquid, limited per day so it cannot be used to slouch all day.
+    func enrollOwner() {
+        guard let python = pythonPath() else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.prompt = L("Registrar", "Enroll")
+        panel.message = L("Selecciona fotos que muestren tu cara.", "Choose photos that show your face.")
+        guard panel.runModal() == .OK else { return }
+        let files = panel.urls.map(\.path)
+        let resources = Bundle.main.resourceURL!
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: python)
+            p.arguments = [resources.appendingPathComponent("postura-eye.py").path, "--enroll-owner"] + files
+            var environment = ProcessInfo.processInfo.environment
+            environment["POSTURA_HOME"] = supportDir.path
+            environment["POSTURA_MODELS"] = resources.appendingPathComponent("models").path
+            p.environment = environment
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            let ok = (try? p.run()) != nil && ({ p.waitUntilExit(); return p.terminationStatus == 0 })()
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = ok ? L("Cara registrada", "Face enrolled") : L("No se pudo registrar la cara", "Could not enroll the face")
+                alert.informativeText = ok ? L("El vídeo solo aparece cuando hay una cara y coincide con estas fotos.", "Video appears only when one face is present and matches these photos.")
+                    : L("Usa fotos nítidas de una sola persona.", "Use clear photos of one person.")
+                alert.runModal()
+            }
+        }
+    }
+
     @objc func fixClicked() { teach("good") }
     func fixesLeft() -> Int { max(0, FIXES_PER_DAY - UserDefaults.standard.integer(forKey: "fixes-" + String(stamp.string(from: Date()).prefix(10)))) }
     func teach(_ label: String) {
+        if privacyEnabled(), label == "good" || label == "bad" {
+            let verdict = label == "bad" ? "hide" : "reveal"
+            do {
+                try verdict.write(to: privacyFeedbackURL, atomically: true, encoding: .utf8)
+                if verdict == "reveal" { revealScreen("visibility feedback") }
+                flash(L("Guardando el ejemplo…", "Saving feedback…"))
+            } catch {
+                flash(L("No se pudo guardar el ejemplo", "Could not save feedback"))
+            }
+            return
+        }
         let now = Date(); var label = label
         if label == "good" && (level > 0 || pBar >= 0.5) {
             let key = "fixes-" + String(stamp.string(from: now).prefix(10)), used = UserDefaults.standard.integer(forKey: key)
@@ -625,7 +840,7 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             UserDefaults.standard.set(used + 1, forKey: key)
             if reasonKind == "glasses" || reasonKind == "sunglasses" { label = "gafas" }      // "I do have my glasses on"
             log("FIX \(used + 1)/\(FIXES_PER_DAY) as \(label), was: \(reason) p=\(f2(pBar)) \(brief(lastSample))")
-            graceUntil = now.addingTimeInterval(8); pBar = 0; badSince = nil
+            graceUntil = now.addingTimeInterval(8); pBar = 0
         } else { log("LABEL \(label) p=\(f2(pBar)) \(brief(lastSample))") }
         try? label.write(to: trainURL, atomically: true, encoding: .utf8)
         flash(label == "bad" ? L("Aprendiendo: esta postura es MALA…", "Learning: this posture is BAD…") : label == "gafas" ? L("Aprendiendo: llevas las gafas puestas…", "Learning: you are wearing your glasses…") : L("Aprendiendo: esta postura es BUENA…", "Learning: this posture is GOOD…"))
@@ -665,14 +880,15 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         let now = Date()
         locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
         let stale = now.timeIntervalSince(lastFrame)
-        if stale > 6 { present = false; reset("no frames") }
-        if stale > 12, camera, !locked { restartCamera() }                       // lid was closed, camera taken away, etc.
+        if stale > 1.25, present || level > 0 { revealScreen("no frames") }
+        if stale > 12, now.timeIntervalSince(lastCameraRestart) > 12, camera, !locked { restartCamera() }                       // lid was closed, camera taken away, etc.
         let k = reasonKind, left = fixesLeft(), glasses = k == "glasses" || k == "sunglasses"
         let cap = reason.prefix(1).uppercased() + reason.dropFirst()
         let (head, line): (String, String) = {
             switch k {
             case "glasses": return (L("Ponte las gafas", "Put your glasses on"), L("Sin gafas · se quita en cuanto te las pongas", "No glasses · this clears as soon as you put them on"))
             case "sunglasses": return (L("Ponte tus gafas", "Put your glasses on"), L("Las gafas de sol no cuentan · ponte las tuyas", "Sunglasses don't count · wear your own glasses"))
+            case "privacy": return (blocked ? L("Pantalla oculta", "Screen hidden") : L("Ocultando pantalla", "Covering screen"), cap)
             case "both": return (L("Siéntate bien y ponte las gafas", "Sit up and put your glasses on"), cap + L(" · se quita cuando arregles las dos cosas", " · clears when both are fixed"))
             case "hidden": return (L("Vuelve frente a la cámara", "Come back in front of the camera"), L("Apartarte no lo quita · siéntate bien donde te vea", "Moving out of view doesn't clear it · sit up where I can see you"))
             default: return (L("Siéntate bien", "Sit up straight"), cap + L(" · se quita en cuanto corrijas la postura", " · this clears as soon as you fix your posture"))
@@ -685,6 +901,11 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         }
         for l in liquids {
             l.title.set(message?.0 ?? head); l.why.set(message?.1 ?? line)
+            if privacyEnabled() {
+                l.setButton(L("Mostrar en esta situación — pulsa G o haz clic", "Reveal in this situation — press G or click"), enabled: true)
+                l.foot.set("")
+                continue
+            }
             l.setButton(left > 0 ? (glasses ? L("Las llevo puestas — pulsa G o haz clic (quedan \(left) hoy)", "I'm wearing them — press G or click (\(left) left today)")
                                             : L("Estoy bien sentado — pulsa G o haz clic (quedan \(left) hoy)", "I'm sitting fine — press G or click (\(left) left today)"))
                                  : L("Sin correcciones por hoy", "No corrections left today"), enabled: left > 0)
@@ -696,8 +917,20 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
         }
         var text = "", color = NSColor.systemGreen
         if now < noteUntil { text = note; color = .systemYellow }
+        else if paused { text = L("Postura en pausa", "Postura paused"); color = .systemGray }
         else if !camera { text = L("Postura: sin cámara (Ajustes → Privacidad → Cámara)", "Postura: no camera (Settings → Privacy → Camera)"); color = .systemOrange }
         else if !present { text = L("Postura: no te veo, no hago nada", "Postura: can't see you, doing nothing"); color = .systemGray }
+        else if privacyEnabled() {
+            if blocked {
+                text = L("Pantalla oculta · ", "Screen hidden · ") + reason
+                color = .systemRed
+            } else if level > 0 {
+                text = releasing ? L("Mostrando pantalla", "Revealing screen") : L("Ocultando pantalla", "Covering screen")
+                color = .systemYellow
+            } else {
+                text = L("Pantalla visible", "Screen visible")
+            }
+        }
         else if pBar >= BLOCK { text = "● \(L("MAL", "BAD")) \(Int(pBar * 100))% · \(reason)"; color = .systemRed }
         else if pBar >= RELEASE { text = "● \(L("dudoso", "unsure")) \(Int(pBar * 100))% · \(reason)"; color = .systemYellow }
         else { text = "● \(L("bien", "good")) \(Int(pBar * 100))%   " + L("⌃⌥⌘B = esto es malo · ⌃⌥⌘G = esto es bueno", "⌃⌥⌘B = this is bad · ⌃⌥⌘G = this is good") }
@@ -706,14 +939,18 @@ final class Guard: NSObject, NSApplicationDelegate, AVCaptureVideoDataOutputSamp
             h.stringValue = text; h.textColor = color
         }
         if prefs.object(forKey: "showHUD") as? Bool ?? true { if hud?.isVisible == false { hud?.orderFrontRegardless() } } else { hud?.orderOut(nil) }
-        shell.update(level: level, blocked: blocked, p: pBar, present: present || dodging, camera: camera, inCall: inCall,
-                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), secs: blockedSeconds, left: left)
+        shell.update(level: level, blocked: blocked, p: pBar, present: present, camera: camera, inCall: inCall,
+                     reason: reason.prefix(1).uppercased() + reason.dropFirst(), secs: blockedSeconds, left: left, paused: paused)
         let mode = blocked ? "blocked" : level > 0 ? "filling" : "off"
         if mode == wroteMode, now.timeIntervalSince(wroteAt) < 2 { return }                  // every 2 s or on a change: less disk writing
         wroteMode = mode; wroteAt = now
-        let st: [String: Any] = ["mode": mode, "level": level, "reason": reason, "p": pBar, "present": present,
+        var st: [String: Any] = ["mode": mode, "level": level, "reason": reason, "p": pBar, "present": present,
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "fixesLeft": left, "at": Int(now.timeIntervalSince1970), "sample": lastSample]
-        if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL) }
+        st["ownerPreview"] = ownerPreviewVisible
+        st["camera"] = cameraName
+        st["privacyMode"] = privacyEnabled()
+        st["paused"] = paused
+        if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL, options: .atomic) }
     }
     func checkCall() {
         DispatchQueue.global().async {
@@ -733,8 +970,8 @@ let agentURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/La
 /// Strict mode (root daemons, see mac/install.sh) keeps the app alive itself; the per-user agent is then not used.
 let strictMode = fm.fileExists(atPath: "/Library/LaunchDaemons/com.sami.postura.plist")
 let underAgent = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == agentLabel
-func requireGlasses() -> Bool { prefs.object(forKey: "requireGlasses") as? Bool ?? fm.fileExists(atPath: supportDir.appendingPathComponent("glasses_yes.npy").path) }
-func keepRunning() -> Bool { prefs.object(forKey: "keepRunning") as? Bool ?? true }
+func requireGlasses() -> Bool { prefs.object(forKey: "requireGlasses") as? Bool ?? false }
+func keepRunning() -> Bool { prefs.object(forKey: "keepRunning") as? Bool ?? false }
 @discardableResult func sh(_ cmd: String) -> Int32 {
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", cmd]
     p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
@@ -744,6 +981,7 @@ let showNote = Notification.Name("io.github.samihalawa.postura.show")
 
 /// Everything the window and the menu show, refreshed twice a second by Guard.tick().
 final class Model: ObservableObject {
+    @Published var paused = prefs.bool(forKey: "coachingPaused")
     @Published var state = ""
     @Published var detail = ""
     @Published var symbol = "figure.stand"
@@ -755,6 +993,8 @@ final class Model: ObservableObject {
     @Published var glasses = requireGlasses()
     @Published var hud = prefs.object(forKey: "showHUD") as? Bool ?? true
     @Published var keep = keepRunning()
+    @Published var privacy = privacyEnabled()
+    @Published var cameraDevice = prefs.string(forKey: "cameraDevice") ?? ""
     @Published var language = prefs.string(forKey: "language") ?? ""
 }
 
@@ -774,41 +1014,53 @@ struct SettingsView: View {
                     }
                 }
                 .padding(.vertical, 4).animation(.smooth, value: m.state).animation(.smooth, value: m.detail)
-                if m.setup.isEmpty {
-                    LabeledContent(L("Mala postura", "Bad posture score")) {
-                        HStack(spacing: 10) {
-                            ProgressView(value: m.p).progressViewStyle(.linear).tint(m.tint).frame(width: 150)
-                            Text("\(Int(m.p * 100))%").monospacedDigit().foregroundStyle(.secondary).frame(width: 38, alignment: .trailing)
-                        }.animation(.smooth, value: m.p)
+                if !m.setup.isEmpty { ProgressView() }
+                HStack {
+                    Button {
+                        g.setPaused(!m.paused)
+                    } label: {
+                        Label(m.paused ? L("Reanudar", "Resume coaching") : L("Pausar", "Pause coaching"),
+                              systemImage: m.paused ? "play.fill" : "pause.fill")
                     }
-                } else {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ProgressView().progressViewStyle(.linear)
-                        Text(m.setup).font(.callout).foregroundStyle(.secondary)
-                    }
+                    .buttonStyle(.borderedProminent)
+                    Spacer()
+                    Text(L("Bloqueo hoy", "Covered today") + " · " + m.blocked)
+                        .foregroundStyle(.secondary)
                 }
-            }
-            Section(L("Hoy", "Today")) {
-                LabeledContent(L("Tiempo bloqueado", "Time blocked"), value: m.blocked)
-                LabeledContent(L("Correcciones disponibles", "Corrections left"), value: "\(m.fixesLeft) / \(FIXES_PER_DAY)")
             }
             Section {
                 HStack {
-                    Button { teach("good") } label: { Label(L("Buena postura", "Good posture"), systemImage: "hand.thumbsup") }
-                    Button { teach("bad") } label: { Label(L("Mala postura", "Bad posture"), systemImage: "hand.thumbsdown") }
+                    Button { teach("good") } label: { Label(m.privacy ? L("Debe mostrar", "Should Reveal") : L("Buena postura", "Good posture"), systemImage: "hand.thumbsup") }
+                    Button { teach("bad") } label: { Label(m.privacy ? L("Debe ocultar", "Should Hide") : L("Mala postura", "Bad posture"), systemImage: "hand.thumbsdown") }
                 }
-                if m.glasses {
+                if m.glasses && !m.privacy {
                     HStack {
                         Button { teach("gafas") } label: { Label(L("Llevo gafas", "Wearing glasses"), systemImage: "eyeglasses") }
                         Button { teach("singafas") } label: { Label(L("Sin gafas", "No glasses"), systemImage: "eye") }
                     }
                 }
             } header: { Text(L("Enseñar", "Teach")) } footer: {
-                Text(L("Marca lo que ves ahora; aprende de los próximos segundos. Atajos: ⌃⌥⌘G buena, ⌃⌥⌘B mala.",
+                Text(m.privacy ? L("Corrige la decisión actual. Atajos: ⌃⌥⌘G mostrar, ⌃⌥⌘B ocultar.", "Correct the current decision. Shortcuts: ⌃⌥⌘G reveal, ⌃⌥⌘B hide.") : L("Marca lo que ves ahora; aprende de los próximos segundos. Atajos: ⌃⌥⌘G buena, ⌃⌥⌘B mala.",
                        "Labels what the camera sees now and over the next few seconds. Shortcuts: ⌃⌥⌘G good, ⌃⌥⌘B bad."))
             }
-            Section(L("Opciones", "Options")) {
-                Toggle(L("Exigir gafas", "Require glasses"), isOn: $m.glasses).onChange(of: m.glasses) { _, v in prefs.set(v, forKey: "requireGlasses"); g.eye.restart() }
+            Section {
+                DisclosureGroup(L("Ajustes avanzados", "Advanced settings")) {
+                Toggle(L("Cubrir si alguien se acerca", "Cover when someone is nearby"), isOn: $m.privacy).onChange(of: m.privacy) { _, v in
+                    prefs.set(v, forKey: "privacyMode"); g.revealScreen("mode changed")
+                }
+                if m.privacy {
+                    Text(L("Usa la cercanía en lugar de la postura.", "Uses proximity instead of posture.")).foregroundStyle(.secondary)
+                }
+                Picker(L("Cámara", "Camera"), selection: $m.cameraDevice) {
+                    Text(L("Automática", "Automatic")).tag("")
+                    ForEach(cameraDevices(), id: \.uniqueID) { device in Text(device.localizedName).tag(device.uniqueID) }
+                }.onChange(of: m.cameraDevice) { _, v in
+                    prefs.set(v, forKey: "cameraDevice"); shell.relaunch()
+                }
+                Button(L("Registrar mi cara para el vídeo", "Enroll my face for the camera preview")) { g.enrollOwner() }
+                if !m.privacy {
+                    Toggle(L("Exigir gafas", "Require glasses"), isOn: $m.glasses).onChange(of: m.glasses) { _, v in prefs.set(v, forKey: "requireGlasses"); g.eye.restart() }
+                }
                 Toggle(L("Mostrar estado en pantalla", "Show status pill"), isOn: $m.hud).onChange(of: m.hud) { _, v in prefs.set(v, forKey: "showHUD") }
                 if !strictMode {
                     Toggle(L("Mantener Postura activa", "Keep Postura running"), isOn: $m.keep).onChange(of: m.keep) { _, v in shell.setKeepRunning(v) }
@@ -818,13 +1070,6 @@ struct SettingsView: View {
                 }.onChange(of: m.language) { _, v in
                     if v.isEmpty { prefs.removeObject(forKey: "language") } else { prefs.set(v, forKey: "language") }; shell.relaunch()
                 }
-            }
-            Section {
-                LabeledContent(L("Versión", "Version"), value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-                HStack {
-                    Link(destination: URL(string: "https://github.com/samihalawa/postura")!) { Label("GitHub", systemImage: "arrow.up.right.square") }
-                    Spacer()
-                    Button(L("Abrir registro", "Open Log")) { NSWorkspace.shared.open(logURL) }
                 }
             } footer: { Text(L("Todo se procesa en este Mac. No se guarda ninguna imagen.", "Everything is processed on this Mac. No images are saved.")) }
         }
@@ -883,9 +1128,13 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
             let i = NSMenuItem(title: t, action: a, keyEquivalent: key); i.target = self; i.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil); menu.addItem(i)
         }
         add(L("Abrir Postura", "Open Postura"), "macwindow", #selector(show))
+        add(L("Pausar", "Pause coaching"), "pause.fill", #selector(togglePause))
+        menu.items.last?.tag = 17
         menu.addItem(.separator())
-        add(L("Esto es buena postura", "This Is Good Posture"), "hand.thumbsup", #selector(good))
-        add(L("Esto es mala postura", "This Is Bad Posture"), "hand.thumbsdown", #selector(bad))
+        add(L("Buena postura", "Good posture"), "hand.thumbsup", #selector(good))
+        menu.items.last?.tag = 18
+        add(L("Mala postura", "Bad posture"), "hand.thumbsdown", #selector(bad))
+        menu.items.last?.tag = 19
         menu.addItem(.separator())
         add(L("Ajustes…", "Settings…"), "gearshape", #selector(show), ",")
         add(L("Acerca de Postura", "About Postura"), "info.circle", #selector(about))
@@ -893,7 +1142,14 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
         if pythonPath() == nil { setup() } else { g.eye.start() }
         if prefs.bool(forKey: "showWindowOnce") || pythonPath() == nil { prefs.removeObject(forKey: "showWindowOnce"); DispatchQueue.main.async { self.show() } }
     }
-    func menuNeedsUpdate(_ menu: NSMenu) { header.title = model.state; sub.title = model.detail }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        header.title = model.state
+        sub.title = model.detail
+        menu.item(withTag: 17)?.title = model.paused ? L("Reanudar", "Resume coaching") : L("Pausar", "Pause coaching")
+        menu.item(withTag: 18)?.title = model.privacy ? L("Debe mostrar", "Should reveal") : L("Buena postura", "Good posture")
+        menu.item(withTag: 19)?.title = model.privacy ? L("Debe ocultar", "Should hide") : L("Mala postura", "Bad posture")
+    }
+    @objc func togglePause() { g.setPaused(!model.paused) }
     @objc func good() { g.teach("good") }
     @objc func bad() { g.teach("bad") }
     @objc func about() { NSApp.activate(ignoringOtherApps: true); NSApp.orderFrontStandardAboutPanel(nil) }
@@ -931,14 +1187,20 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
     }
 
     /// Called by Guard.tick(): status for the menu bar icon, the menu and the window.
-    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, secs: Double, left: Int) {
+    func update(level: Double, blocked: Bool, p: Double, present: Bool, camera: Bool, inCall: Bool, reason: String, secs: Double, left: Int, paused: Bool) {
+        if model.paused != paused { model.paused = paused }
         let (st, d, sym, tint): (String, String, String, Color) = {
             if !model.setup.isEmpty { return (L("Preparando…", "Setting up…"), L("Primera vez: instalando el modelo", "First launch: installing the model"), "arrow.down.circle", .blue) }
+            if paused { return (L("En pausa", "Coaching paused"), L("Reanuda para volver a usar la cámara", "Resume to turn the camera back on"), "pause.circle", .gray) }
             if !camera { return (L("Sin cámara", "No camera"), L("Permítela en Ajustes → Privacidad → Cámara", "Allow it in Settings → Privacy → Camera"), "video.slash", .orange) }
             if blocked { return (L("Bloqueado", "Blocked"), reason, "figure.fall", .red) }
-            if level > 0 { return (L("Corrige la postura", "Fix your posture"), reason, "figure.fall", .orange) }
+            if level > 0 {
+                let action = privacyEnabled() ? L("Ocultando pantalla", "Covering screen") : L("Corrige la postura", "Fix your posture")
+                return (action, reason, "figure.fall", .orange)
+            }
             if inCall { return (L("En una llamada", "On a call"), L("Solo un aviso suave, nunca bloquea", "Only a gentle hint, never blocks"), "phone", .blue) }
             if !present { return (L("No te veo", "Not watching"), L("Nadie delante de la cámara", "Nobody in front of the camera"), "eye.slash", .gray) }
+            if privacyEnabled() { return (L("Pantalla visible", "Screen visible"), L("Privacidad activa", "Privacy active"), "eye", .green) }
             if p >= RELEASE { return (L("Dudoso", "Unsure"), reason, "figure.stand", .yellow) }
             return (L("Buena postura", "Good posture"), L("Vigilando", "Watching"), "figure.stand", .green)
         }()
@@ -958,5 +1220,5 @@ let app = NSApplication.shared
 let g = Guard()
 if !shell.launch() { exit(0) }
 app.delegate = g
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.run()
