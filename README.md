@@ -48,11 +48,15 @@ shell installer's `uninstall --purge`. The shell installer also removes an older
 
 ## Forced Rest
 
-Open **Settings → Advanced → Forced Rest** to cover every display for 3, 5, or 8 hours. The default is
-3 hours. Save your work, review the duration, and confirm to begin. The cover shows the remaining time
+Open **Settings → Advanced → Forced Rest** to cover every display for 3 hours. Save your
+work, review the duration, and confirm to begin. The cover shows the remaining time
 and clears automatically when it reaches zero, even with nobody in front of the camera. There is no
 in-app cancellation, and the countdown is restored if Postura restarts. Forced Rest uses macOS
 presentation mode in your signed-in session.
+
+Enable **Daily, 1:00–4:00 a.m.** in the same panel for a recurring rest in your Mac's local time.
+When daily rest is enabled, a manual rest that overlaps 1:00 a.m. continues through at least 4:00 a.m.
+The optional strict-mode keeper can restore the app after the installed copy is removed.
 
 ## Replay a recording
 

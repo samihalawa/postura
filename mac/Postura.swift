@@ -619,7 +619,7 @@ final class Liquid {
 }
 
 struct ForcedRest: Codable {
-    static let durations = [3, 5, 8]
+    static let manualHours = 3
     private static let maximumSeconds = 8.0 * 3600
     static let file = supportDir.appendingPathComponent("forced-rest.json")
     static let bootID: String? = {
@@ -665,6 +665,22 @@ struct ForcedRest: Codable {
     static func countdown(_ seconds: Double) -> String {
         let whole = Int(ceil(seconds))
         return String(format: "%d:%02d:%02d", whole / 3600, (whole / 60) % 60, whole % 60)
+    }
+}
+
+enum DailyRest {
+    static let preference = "dailyForcedRest"
+
+    static func window(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> DateInterval? {
+        guard let start = calendar.date(bySettingHour: 1, minute: 0, second: 0, of: date),
+              let end = calendar.date(bySettingHour: 4, minute: 0, second: 0, of: date),
+              start < end else { return nil }
+        return DateInterval(start: start, end: end)
+    }
+
+    static func remaining(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> Double? {
+        guard let window = window(at: date, calendar: calendar), date >= window.start, date < window.end else { return nil }
+        return window.end.timeIntervalSince(date)
     }
 }
 
@@ -775,6 +791,7 @@ final class Guard: NSObject, NSApplicationDelegate {
             }
         }
         rest = ForcedRest.load()
+        checkDailyRest(at: Date())
         updateCameraSampling()
         shell.start()
         if let rest { showRest(seconds: rest.remaining()) }
@@ -1004,18 +1021,35 @@ final class Guard: NSObject, NSApplicationDelegate {
                                      .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
     }
 
-    func startRest(hours: Int) throws {
-        guard ForcedRest.durations.contains(hours), rest == nil else { return }
-        let session = ForcedRest(seconds: Double(hours * 3600))
+    func startRest() throws {
+        guard rest == nil else { return }
+        try applyRest(ForcedRest(seconds: Double(ForcedRest.manualHours * 3600)))
+        log("manual forced rest started for \(ForcedRest.manualHours) h")
+        tick()
+    }
+
+    private func checkDailyRest(at now: Date) {
+        guard prefs.bool(forKey: DailyRest.preference),
+              let seconds = DailyRest.remaining(at: now),
+              (rest?.remaining(now: now) ?? 0) + 1 < seconds else { return }
+        do {
+            try applyRest(ForcedRest(seconds: seconds, now: now))
+            log("daily forced rest active")
+        } catch {
+            // Retry on the next status tick without leaving the session in a partially applied state.
+            if wroteMode != "daily-rest-error" { log("could not save daily forced rest: \(error)") }
+            writeStatus(now, mode: "daily-rest-error")
+        }
+    }
+
+    private func applyRest(_ session: ForcedRest) throws {
         try session.save()
-        log("forced rest started for \(hours) h")
-        revealScreen("forced rest started")
+        if rest == nil { revealScreen("forced rest started") }
         rest = session
         updateCameraSampling()
         queue.async { if self.session.isRunning { self.session.stopRunning() } }
         hud?.orderOut(nil)
         showRest(seconds: session.remaining())
-        tick()
     }
 
     private func showRest(seconds: Double) {
@@ -1109,6 +1143,7 @@ final class Guard: NSObject, NSApplicationDelegate {
     func tick() {
         let now = Date()
         locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
+        checkDailyRest(at: now)
         if let rest {
             let seconds = rest.remaining(now: now)
             showRest(seconds: seconds)
@@ -1185,6 +1220,7 @@ final class Guard: NSObject, NSApplicationDelegate {
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         st["ownerPreview"] = ownerPreviewVisible
         st["camera"] = cameraName
+        st["dailyForcedRest"] = prefs.bool(forKey: DailyRest.preference)
         st.merge(extra) { _, new in new }
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL, options: .atomic) }
     }
@@ -1373,40 +1409,55 @@ struct PosturaView: View {
 }
 
 struct ForcedRestSettingsView: View {
-    @State private var hours = 3
     @State private var confirmation = false
     @State private var saveFailed = false
+    @State private var confirmDailyRest = false
+    @AppStorage(DailyRest.preference) private var dailyRestEnabled = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(L("Descanso forzado", "Forced Rest")).font(.title2.bold())
-            Text(L("Cubre todas las pantallas y bloquea el uso normal del Mac durante el tiempo elegido, incluso si no hay nadie ante la cámara.",
-                   "Cover every display and block normal Mac use for the selected time, even when nobody is in front of the camera."))
-            Picker(L("Duración", "Duration"), selection: $hours) {
-                ForEach(ForcedRest.durations, id: \.self) { Text("\($0) h").tag($0) }
-            }
-            .pickerStyle(.segmented)
+            Text(L("Cubre todas las pantallas durante tres horas, incluso si no hay nadie ante la cámara.",
+                   "Cover every display for three hours, even when nobody is in front of the camera."))
+            Divider()
+            Toggle(L("Cada día, 1:00–4:00", "Daily, 1:00–4:00 a.m."), isOn: Binding(
+                get: { dailyRestEnabled },
+                set: { enabled in
+                    if enabled { confirmDailyRest = true }
+                    else { dailyRestEnabled = false }
+                }
+            ))
+            Text(L("Se aplica en la hora local. Puedes empezar un descanso manual antes.",
+                   "Uses local time. You can start a manual rest earlier."))
+                .font(.caption).foregroundStyle(.secondary)
             Text(L("Cuando empiece, Postura no ofrecerá una opción para terminar antes.",
                    "Once the rest starts, Postura provides no way to end it early."))
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
                 Button(L("Volver", "Back")) { dismiss() }
                 Spacer()
-                Button(L("Revisar descanso de \(hours) h…", "Review \(hours)-hour rest…")) { confirmation = true }
+                Button(L("Revisar descanso de 3 h…", "Review 3-hour rest…")) { confirmation = true }
             }
         }
         .padding(24)
         .frame(width: 390)
-        .alert(L("¿Iniciar descanso forzado de \(hours) horas?", "Start a \(hours)-hour Forced Rest?"), isPresented: $confirmation) {
+        .alert(L("¿Iniciar descanso forzado de 3 horas?", "Start a 3-hour Forced Rest?"), isPresented: $confirmation) {
             Button(L("Cancelar", "Cancel"), role: .cancel) {}
-            Button(L("Iniciar descanso de \(hours) horas", "Start \(hours)-hour rest"), role: .destructive) {
-                do { try g.startRest(hours: hours); dismiss() }
+            Button(L("Iniciar descanso de 3 horas", "Start 3-hour rest"), role: .destructive) {
+                do { try g.startRest(); dismiss() }
                 catch { saveFailed = true }
             }
         } message: {
             Text(L("Guarda tu trabajo primero. El descanso empieza al confirmar y continúa si se reinicia Postura.",
                    "Save your work first. The rest starts when you confirm and continues if Postura restarts."))
+        }
+        .alert(L("¿Activar el descanso diario de 1:00 a 4:00?", "Enable daily rest from 1:00 to 4:00 a.m.?"), isPresented: $confirmDailyRest) {
+            Button(L("Cancelar", "Cancel"), role: .cancel) {}
+            Button(L("Activar descanso diario", "Enable daily rest")) { dailyRestEnabled = true }
+        } message: {
+            Text(L("Postura cubrirá todas las pantallas en ese horario cada día. Guarda tu trabajo antes de la 1:00.",
+                   "Postura will cover every display during these hours every day. Save your work before 1:00 a.m."))
         }
         .alert(L("No se pudo iniciar el descanso", "Could not start Forced Rest"), isPresented: $saveFailed) {
             Button(L("Aceptar", "OK"), role: .cancel) {}
