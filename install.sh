@@ -1,5 +1,5 @@
 #!/bin/sh
-# Postura installer: puts the latest signed and notarized Postura.app in /Applications (or ~/Applications) and opens it.
+# Postura installer: puts the latest signed and notarized Postura.app in ~/Applications and opens it.
 # The app opens from the Dock and sets up its posture model on first launch.
 #   curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh
 #   sh install.sh uninstall          remove the app and its login agent (keeps your examples)
@@ -8,23 +8,54 @@
 set -eu
 REPO=samihalawa/postura; LABEL=io.github.samihalawa.postura
 SUP="$HOME/Library/Application Support/Postura"; PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-DEST=/Applications; [ -w "$DEST" ] || { DEST="$HOME/Applications"; mkdir -p "$DEST"; }
+DEST="$HOME/Applications"
+APP="$DEST/Postura.app"
+LEGACY=/Applications/Postura.app
+
+agent_program() {
+  plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null || true
+}
+
+homebrew_owns_app() {
+  for brew_bin in "$(command -v brew || true)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "$brew_bin" ] && "$brew_bin" list --cask --versions postura >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+[ "$(uname)" = Darwin ] || { echo "Postura needs macOS" >&2; exit 1; }
+
+stop_copy() {
+  exe="$1/Contents/MacOS/Postura"
+  if [ "$(agent_program)" = "$exe" ]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    rm -f "$PLIST"
+  fi
+  for pid in $(pgrep -x Postura || true); do
+    [ "$(ps -p "$pid" -o comm= || true)" != "$exe" ] || kill "$pid" 2>/dev/null || true
+  done
+}
+
+remove_legacy_copy() {
+  if [ "$(agent_program)" = "$LEGACY/Contents/MacOS/Postura" ] && ! homebrew_owns_app; then
+    stop_copy "$LEGACY"
+    rm -rf "$LEGACY"
+    echo "Removed old shell install at $LEGACY"
+  fi
+}
 
 if [ "${1:-}" = uninstall ]; then
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  for pid in $(pgrep -x Postura || true); do
-  executable=$(ps -p "$pid" -o comm= || true)
-  case "$executable" in
-    "/Applications/Postura.app/Contents/MacOS/Postura"|"$HOME/Applications/Postura.app/Contents/MacOS/Postura") kill "$pid" 2>/dev/null || true ;;
-  esac
-done
-  rm -rf /Applications/Postura.app "$HOME/Applications/Postura.app" "$PLIST" "$HOME/.local/bin/postura-train"
+  remove_legacy_copy
+  stop_copy "$APP"
+  rm -rf "$APP"
   [ "${2:-}" != --purge ] || rm -rf "$SUP" "$HOME/Library/Logs/postura.log" "$HOME/Library/Logs/postura-features.jsonl" \
     "$HOME/Library/Logs/postura.out.log" "$HOME/Library/Logs/postura-setup.log"
-  echo "Postura removed"; exit 0
+  echo "Removed $APP"
+  exit 0
 fi
 
-[ "$(uname)" = Darwin ] || { echo "Postura needs macOS"; exit 1; }
 URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep -o '"browser_download_url": *"[^"]*Postura-[^"]*\.zip"' | head -1 | cut -d'"' -f4)
 [ -n "$URL" ] || { echo "Could not find the latest release"; exit 1; }
 echo "Downloading $URL"
@@ -37,10 +68,11 @@ expected=$(awk -v asset="$asset" '$2==asset { print $1 }' "$T/SHA256SUMS.txt")
 actual=$(shasum -a 256 "$T/$asset" | cut -d' ' -f1)
 [ "$actual" = "$expected" ] || { echo "Postura download checksum mismatch" >&2; exit 1; }
 ditto -x -k "$T/$asset" "$T"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-for pid in $(pgrep -x Postura || true); do
-  [ "$(ps -p "$pid" -o comm= || true)" != "$DEST/Postura.app/Contents/MacOS/Postura" ] || kill "$pid" 2>/dev/null || true
-done
-rm -rf "$DEST/Postura.app"; mv "$T/Postura.app" "$DEST/"; rm -rf "$T"
-open "$DEST/Postura.app"
-echo "Installed $DEST/Postura.app. Allow the camera when asked; Open Postura from the Dock or menu bar."
+codesign --verify --strict "$T/Postura.app"
+mkdir -p "$DEST"
+remove_legacy_copy
+stop_copy "$APP"
+rm -rf "$APP"
+mv "$T/Postura.app" "$APP"
+open "$APP"
+echo "Installed $APP. Open Postura from the Dock and allow camera access if prompted."

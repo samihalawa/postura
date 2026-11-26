@@ -18,7 +18,14 @@ Everything runs on the Mac. No camera frames are stored or sent. Postura stores 
 brew install --cask samihalawa/tap/postura
 ```
 
-Or without Homebrew: `curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh`
+Or install to `~/Applications` with the shell installer.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh
+```
+
+Use one installation route. Each [GitHub release](https://github.com/samihalawa/postura/releases/latest) includes
+the notarized app and `SHA256SUMS.txt`.
 
 Open **Postura** and allow camera access. The Dock icon opens the Postura window, and the menu bar icon offers the same
 basic controls. The first launch sets up a local MediaPipe environment using [uv](https://github.com/astral-sh/uv).
@@ -29,8 +36,15 @@ you close its window.
 - **Window** (Dock → Postura): live status and **Good posture** / **Bad posture** feedback. Camera, language, on-screen status, and the optional glasses requirement are in **Settings**.
 - **Log**: `~/Library/Logs/postura.log`, one line per decision.
 
-Uninstall: `brew uninstall --cask postura` (`--zap` also deletes your examples and logs), or
-`curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh -s uninstall`.
+Remove the Homebrew install with `brew uninstall --cask postura`, or remove the shell install with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh -s uninstall
+```
+
+Your examples are kept by default. To delete them and the local logs as well, use Homebrew's `--zap` or the
+shell installer's `uninstall --purge`. The shell installer also removes an older shell copy in
+`/Applications` when its login service identifies it and Homebrew does not manage it.
 
 ## Replay a recording
 
@@ -49,6 +63,8 @@ score, and reason. To test live detection with a recording, choose **OBS Virtual
 | Leave the frame while it is warning | The cover clears when nobody is detected. |
 | Are on a video call (FaceTime, Teams, WebRTC in the browser) | Only a faint edge glow, it never blocks. |
 | Disagree with it | Press **Ctrl-Opt-Cmd-G** or click **My posture is good**. Postura learns from the live camera and reveals the screen once it detects corrected posture. |
+
+<img src=".github/assets/cover.svg" alt="Illustration of the posture cover and feedback button" width="100%">
 
 ## Teach it your posture
 
@@ -70,11 +86,21 @@ by default. Postura saves numerical examples on this Mac.
 
 ## How it works
 
+```mermaid
+flowchart LR
+    A[Mac camera] --> B[On-device posture measurements]
+    C[Saved posture feedback] --> B
+    B --> D{Sustained bad posture?}
+    D -->|Yes| E[Gradual cover]
+    D -->|Clear or empty| F[Screen visible]
+```
+
 `Postura.app` (Swift, AppKit, Core Animation) owns the camera, the timing and the screens. Two to six frames a second (more while it suspects bad posture)
 go to `postura-eye.py`, which runs MediaPipe Pose Landmarker and Face Landmarker and returns a score from 0 (good)
-to 1 (bad) with a reason. The app drives the glow: a rotating conic gradient shown through
-blurred strokes on the display edge, plus a colour wash and a frosted blur behind a slowly waving front. Every boundary is
-feathered with a GPU shadow mask. The time and correction appear on the cover.
+to 1 (bad) with a reason. The glow and frosted screen ease in and out as you change posture. The cover shows the time, the correction
+and its feedback action. Feedback and Settings buttons use native macOS Liquid Glass where available.
+The cover preview can show a single locally verified person when an existing local face reference matches.
+Otherwise the cover shows the coaching message alone.
 
 Telemetry for tuning lives in `~/Library/Logs/postura-features.jsonl` (one row of numbers per second).
 
@@ -99,7 +125,7 @@ who want detection that learns their own posture and an enforcement that cannot 
 
 ## Limits
 
-- Tested on Apple silicon with macOS 27. Local contributor builds use ad-hoc signing by default.
+- Tested on Apple silicon with macOS 27.3. Local contributor builds use ad-hoc signing by default.
 - With multiple faces in view, Postura scores the nearest face.
 - Blocking uses kiosk presentation options; the login item restarts it if it quits.
 
@@ -107,8 +133,12 @@ who want detection that learns their own posture and an enforcement that cannot 
 
 - Glow technique: [AppleIntelligenceGlowEffect](https://github.com/jacobamobin/AppleIntelligenceGlowEffect) by Jacob Mobin and
   [IntelligenceGlow](https://github.com/Livsy90/IntelligenceGlow) by Livsy90 (MIT), rebuilt here in Core Animation with an organic, moving shape.
-- Pose and face models: [Google MediaPipe](https://github.com/google-ai-edge/mediapipe) (Apache-2.0), downloaded at install.
+- Pose and face models: [Google MediaPipe](https://github.com/google-ai-edge/mediapipe) (Apache-2.0), bundled in the release.
+
+## Contributing
+
+See [Contributing](CONTRIBUTING.md) for local builds and bug reports.
 
 ## License
 
-MIT
+[MIT](LICENSE)

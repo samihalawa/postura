@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="495" viewBox="0 0 1200 495" role="img" aria-labelledby="title">
+  <title id="title">Illustration of the Postura screen cover</title>
+  <defs>
+    <linearGradient id="cover" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#624679"/>
+      <stop offset=".54" stop-color="#312e57"/>
+      <stop offset="1" stop-color="#51456d"/>
+    </linearGradient>
+    <linearGradient id="edge" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#d4a5f0"/>
+      <stop offset=".45" stop-color="#7976d7"/>
+      <stop offset="1" stop-color="#ebb1a1"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="495" rx="25" fill="#0d1117"/>
+  <rect x="38" y="33" width="1124" height="429" rx="18" fill="url(#cover)" stroke="url(#edge)" stroke-width="2"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, system-ui, sans-serif" fill="#fff">
+    <text x="82" y="117" font-size="49" font-weight="650">9:41</text>
+    <text x="84" y="147" font-size="17" fill-opacity=".78">Thursday, November 26</text>
+    <text x="83" y="362" font-size="35" font-weight="650">Sit up straight</text>
+    <text x="84" y="395" font-size="17" fill-opacity=".8">Like your bad-posture examples</text>
+    <rect x="893" y="368" width="222" height="45" rx="22.5" fill="#fff" fill-opacity=".14" stroke="#fff" stroke-opacity=".28"/>
+    <text x="1004" y="396" font-size="16" font-weight="600" text-anchor="middle">My posture is good</text>
+  </g>
+</svg>

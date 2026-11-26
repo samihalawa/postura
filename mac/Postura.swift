@@ -12,6 +12,7 @@ import Vision
 import UniformTypeIdentifiers
 import Accelerate
 import Carbon.HIToolbox
+import CoreImage
 
 let fm = FileManager.default
 let supportDir = ProcessInfo.processInfo.environment["POSTURA_HOME"].map { URL(fileURLWithPath: $0) }
@@ -129,10 +130,17 @@ final class Eye {
                 CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
                 let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
                 guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
-                let header = preview ? "\(w) \(h) owner\n" : "\(w) \(h)\n"
-                var data = Data(header.utf8); data.reserveCapacity(w * h * 4 + 24)
-                for y in 0..<h { data.append(Data(bytesNoCopy: base + y * bpr, count: w * 4, deallocator: .none)) }
-                return data
+                let width = 640, height = 480
+                var data = Data((preview ? "\(width) \(height) owner\n" : "\(width) \(height)\n").utf8)
+                let headerSize = data.count
+                data.count += width * height * 4
+                let result = data.withUnsafeMutableBytes { bytes in
+                    var source = vImage_Buffer(data: base, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: bpr)
+                    var output = vImage_Buffer(data: bytes.baseAddress! + headerSize, height: vImagePixelCount(height),
+                                              width: vImagePixelCount(width), rowBytes: width * 4)
+                    return vImageScale_ARGB8888(&source, &output, nil, vImage_Flags(kvImageNoFlags))
+                }
+                return result == kvImageNoError ? data : nil
             }
             guard let data else { throw CocoaError(.fileReadUnknown) }
             try fh.write(contentsOf: data)
@@ -176,81 +184,65 @@ func fade(_ v: NSView, _ on: Bool, delay: Double, duration: Double) {
 
 /// Only the exact frame that passed identity matching enters the display pipeline.
 final class Silhouette {
-    typealias Preview = (texture: MTLTexture, crop: SIMD3<Float>, opacity: Float)
     private let queue = DispatchQueue(label: "postura.shape", qos: .userInitiated), lock = NSLock()
-    static let pw = 320, ph = 240
-    private var busy = false, epoch = 0, missing: CFTimeInterval?, verified = 0.0
-    private var goal: (pixels: [Float], crop: SIMD3<Float>)?
-    private var ring: [MTLTexture] = [], turn = 0
-    private let request: VNGeneratePersonSegmentationRequest = { let r = VNGeneratePersonSegmentationRequest(); r.qualityLevel = .balanced; r.outputPixelFormat = kCVPixelFormatType_OneComponent8; return r }()
-
-    func reject() {
-        lock.lock(); defer { lock.unlock() }
-        epoch += 1
-        if missing == nil { missing = CACurrentMediaTime() }
-    }
+    private var busy = false, epoch = 0
+    private var latest: (image: CGImage, captured: CFTimeInterval)?
+    private lazy var context = CIContext(options: [.cacheIntermediates: false])
+    private let request: VNGeneratePersonSegmentationRequest = {
+        let request = VNGeneratePersonSegmentationRequest()
+        request.qualityLevel = .balanced
+        request.outputPixelFormat = kCVPixelFormatType_OneComponent8
+        return request
+    }()
 
     func clear() {
         lock.lock(); defer { lock.unlock() }
-        if busy || goal != nil { epoch += 1 }
-        goal = nil; missing = nil; verified = 0
+        if busy || latest != nil { epoch += 1 }
+        latest = nil
     }
 
-    func feed(_ pb: CVPixelBuffer, crop: SIMD3<Float>) {
+    func feed(_ frame: CVPixelBuffer, crop: SIMD3<Float>) {
         lock.lock()
         guard !busy else { lock.unlock(); return }
         busy = true
         let ticket = epoch
-        let submitted = CACurrentMediaTime()
+        let captured = CACurrentMediaTime()
         lock.unlock()
         queue.async { [self] in
-            let pixels = autoreleasepool { () -> [Float]? in
-                guard (try? VNImageRequestHandler(cvPixelBuffer: pb).perform([request])) != nil,
-                      let mask = request.results?.first?.pixelBuffer else { return nil }
-                return Silhouette.colours(pb, mask)
-            }
+            let image = autoreleasepool { portrait(frame, crop: crop) }
             lock.lock(); defer { lock.unlock() }
             busy = false
-            guard ticket == epoch, let pixels else { return }
-            goal = (pixels, crop)
-            missing = nil; verified = submitted
+            guard ticket == epoch else { return }
+            latest = image.map { ($0, captured) }
         }
     }
-    /// Camera detail premultiplied by the person mask so the room cannot bleed into the portrait.
-    static func colours(_ pb: CVPixelBuffer, _ m: CVPixelBuffer) -> [Float]? {
-        guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA else { return nil }
-        CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        CVPixelBufferLockBaseAddress(m, .readOnly); defer { CVPixelBufferUnlockBaseAddress(m, .readOnly) }
-        let W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
-        let mw = CVPixelBufferGetWidth(m), mh = CVPixelBufferGetHeight(m), mb = CVPixelBufferGetBytesPerRow(m)
-        guard let b = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self),
-              let mk = CVPixelBufferGetBaseAddress(m)?.assumingMemoryBound(to: UInt8.self) else { return nil }
-        var c = [SIMD4<Float>](repeating: .zero, count: pw * ph)
-        for y in 0..<ph { let row = b + (y * H / ph) * bpr, mrow = mk + (y * mh / ph) * mb
-            for x in 0..<pw { let q = row + (x * W / pw) * 4, a = Float(mrow[x * mw / pw]) / 255
-                c[y * pw + x] = SIMD4(Float(q[2]), Float(q[1]), Float(q[0]), 255) * (a / 255) } }
-        return c.withUnsafeBufferPointer { $0.withMemoryRebound(to: Float.self) { Array($0) } }
+
+    private func portrait(_ frame: CVPixelBuffer, crop: SIMD3<Float>) -> CGImage? {
+        guard (try? VNImageRequestHandler(cvPixelBuffer: frame).perform([request])) != nil,
+              let mask = request.results?.first?.pixelBuffer else { return nil }
+        let camera = CIImage(cvPixelBuffer: frame)
+        let extent = camera.extent
+        let height = min(extent.height, extent.width * 0.75, extent.height * CGFloat(crop.z) * 1.75)
+        let width = height / 0.75
+        let x = min(extent.width - width, max(0, CGFloat(crop.x) * extent.width - width / 2))
+        let y = min(extent.height - height, max(0, (1 - CGFloat(crop.y)) * extent.height - height * 0.64))
+        let rect = CGRect(x: x, y: y, width: width, height: height).integral.intersection(extent)
+        let matte = CIImage(cvPixelBuffer: mask)
+        let scaled = matte.transformed(by: CGAffineTransform(scaleX: extent.width / matte.extent.width,
+                                                              y: extent.height / matte.extent.height))
+        let softened = scaled.clampedToExtent().applyingGaussianBlur(sigma: 1.5).cropped(to: rect)
+        let transparent = CIImage(color: .clear).cropped(to: rect)
+        let cutout = camera.cropped(to: rect).applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: transparent,
+            kCIInputMaskImageKey: softened
+        ])
+        return context.createCGImage(cutout, from: rect)
     }
-    /// Once per animation frame; nil while there is no shape to show.
-    func texture() -> Preview? {
-        let now = CACurrentMediaTime()
-        lock.lock()
-        let g = goal
-        let fadeAt = min(missing ?? .infinity, verified + 0.65)
-        let opacity = Float(max(0, min(1, 1 - (now - fadeAt) / 0.25)))
-        if opacity == 0 { goal = nil }
-        lock.unlock()
-        guard opacity > 0, let g, let dev = Glow.gpu?.dev else { return nil }
-        if ring.isEmpty {
-            func make(_ f: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture? {
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false); d.usage = .shaderRead; return dev.makeTexture(descriptor: d)
-            }
-            ring = (0..<4).compactMap { _ in make(.rgba32Float, Silhouette.pw, Silhouette.ph) }
-        }
-        guard !ring.isEmpty else { return nil }
-        turn = (turn + 1) % ring.count
-        ring[turn].replace(region: MTLRegionMake2D(0, 0, Silhouette.pw, Silhouette.ph), mipmapLevel: 0, withBytes: g.pixels, bytesPerRow: Silhouette.pw * 16)
-        return (ring[turn], g.crop, opacity)
+
+    func image() -> CGImage? {
+        lock.lock(); defer { lock.unlock() }
+        guard let latest, CACurrentMediaTime() - latest.captured < 0.75 else { return nil }
+        return latest.image
     }
 }
 let silhouette = Silhouette()
@@ -263,8 +255,6 @@ final class Glow {
         var front = SIMD4<Float>(0, 0, 0, 1)          // half-width, half-height, wave amplitude, feather
         var rim = SIMD4<Float>(0, 1, 1, 0)            // wave amplitude, rim width factor, front width factor, time
         var opacity = SIMD4<Float>(0, 0, 0, 0)        // tint, colour wash, rim, front
-        var frame = SIMD4<Float>(0, 0, 1, 1)          // camera circle: screen center x, center y, radius
-        var shapeA = SIMD4<Float>(0, 0, 0, 0)         // camera opacity, source center x/y, crop height
         var stops: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = (.zero, .zero, .zero, .zero, .zero, .zero, .zero)
     }
     static let scale: CGFloat = 2
@@ -274,10 +264,6 @@ final class Glow {
         guard let p = try? d.makeRenderPipelineState(descriptor: r) else { log("no Metal pipeline"); return nil }
         return (d, q, p)
     }()
-    static let blank: MTLTexture? = {
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 1, height: 1, mipmapped: false); d.usage = .shaderRead
-        let t = gpu?.dev.makeTexture(descriptor: d); var none = SIMD4<Float>.zero; t?.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &none, bytesPerRow: 16); return t
-    }()
     let layer = CAMetalLayer(), work = DispatchQueue(label: "postura.glow", qos: .userInteractive), lock = NSLock()
     var inFlight = 0
     init() {
@@ -285,22 +271,22 @@ final class Glow {
         layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB); layer.contentsGravity = .resize; layer.magnificationFilter = .linear
     }
     /// Never waits on the main thread: a frame is skipped when two are still on their way.
-    func render(_ p: Params, _ shape: MTLTexture?) {
+    func render(_ p: Params) {
         guard let gpu = Glow.gpu else { return }
         lock.lock(); let busy = inFlight >= 2; if !busy { inFlight += 1 }; lock.unlock()
         if busy { return }
         work.async { [self] in
             func done() { lock.lock(); inFlight -= 1; lock.unlock() }
             guard let d = layer.nextDrawable(), let c = gpu.queue.makeCommandBuffer() else { done(); return }
-            Glow.encode(p, shape, into: d.texture, c, gpu.pipe)
+            Glow.encode(p, into: d.texture, c, gpu.pipe)
             c.addCompletedHandler { _ in done() }
             c.present(d); c.commit()
         }
     }
-    static func encode(_ p: Params, _ shape: MTLTexture?, into t: MTLTexture, _ c: MTLCommandBuffer, _ pipe: MTLRenderPipelineState) {
+    static func encode(_ p: Params, into t: MTLTexture, _ c: MTLCommandBuffer, _ pipe: MTLRenderPipelineState) {
         let r = MTLRenderPassDescriptor(); r.colorAttachments[0].texture = t; r.colorAttachments[0].loadAction = .dontCare; r.colorAttachments[0].storeAction = .store
         guard let e = c.makeRenderCommandEncoder(descriptor: r) else { return }
-        var q = p; e.setFragmentTexture(shape ?? Glow.blank, index: 1); e.setRenderPipelineState(pipe); e.setFragmentBytes(&q, length: MemoryLayout<Params>.stride, index: 0)
+        var q = p; e.setRenderPipelineState(pipe); e.setFragmentBytes(&q, length: MemoryLayout<Params>.stride, index: 0)
         e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
     }
     static func cdf(_ z: Float) -> Float { 1 / (1 + exp(-1.702 * min(20, max(-20, z)))) }
@@ -314,7 +300,7 @@ final class Glow {
     static let shader = """
     #include <metal_stdlib>
     using namespace metal;
-    struct P { float2 size, pad; float4 front, rim, op, frame, sa; float4 st[7]; };
+    struct P { float2 size, pad; float4 front, rim, op; float4 st[7]; };
     struct V { float4 pos [[position]]; float2 uv; };
     vertex V v(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V o; o.pos = float4(q * 2 - 1, 0, 1); o.uv = q; return o; }
     static float cdf(float z) { return 1 / (1 + exp(-1.702 * clamp(z, -20.0, 20.0))); }
@@ -334,12 +320,7 @@ final class Glow {
         for (int i = 0; i < 6; i++) { float w = max(p.st[i + 1].w - p.st[i].w, 1e-4); c = mix(c, p.st[i + 1].rgb, clamp((a - p.st[i].w) / w, 0.0, 1.0)); }
         return c;
     }
-    static float4 at(texture2d<float> s, int2 i) { i = clamp(i, int2(0), int2(s.get_width() - 1, s.get_height() - 1)); return s.read(uint2(i)); }
-    static float4 field(texture2d<float> s, float2 uv) {                             // bilinear by hand: 32-bit floats are not filterable everywhere
-        float2 x = uv * float2(s.get_width(), s.get_height()) - 0.5, fx = fract(x); int2 i = int2(floor(x));
-        return mix(mix(at(s, i), at(s, i + int2(1, 0)), fx.x), mix(at(s, i + int2(0, 1)), at(s, i + int2(1, 1)), fx.x), fx.y);
-    }
-    fragment float4 f(V in [[stage_in]], constant P& p [[buffer(0)]], texture2d<float> art [[texture(1)]]) {
+    fragment float4 f(V in [[stage_in]], constant P& p [[buffer(0)]]) {
         float2 q = (in.uv - 0.5) * p.size; float t = p.rim.w, R = length(q);
         float ang = atan2(q.x, q.y) / (2 * M_PI_F) + t / 60;
         float3 light = around(ang, p), wash = 0;
@@ -362,23 +343,6 @@ final class Glow {
         float w = p.op.y * region; o = float4(wash, 1) * w + o * (1 - w);
         o = float4(light, 1) * rim + o * (1 - rim);
         o = float4(light, 1) * front + o * (1 - front);
-        if (p.sa.x > 0.001) {
-            float2 circle = (in.uv * p.size - p.frame.xy) / p.frame.z;
-            float r = length(circle);
-            if (r < 1.03) {
-                float2 camera = p.sa.yz + float2(-circle.x * 0.75, -circle.y) * p.sa.w * 0.5;
-                if (all(camera > 0) && all(camera < 1)) {
-                    float4 raw = field(art, camera);
-                    float matte = smoothstep(0.67, 0.94, raw.a);
-                    float clip = 1 - smoothstep(0.88, 1.0, r);
-                    float frameEdge = smoothstep(0, 0.045, min(min(camera.x, camera.y), min(1 - camera.x, 1 - camera.y)));
-                    float3 original = saturate(raw.rgb / max(raw.a, 0.02));
-                    o = mix(o, float4(original, 1), matte * clip * frameEdge * p.sa.x);
-                }
-                float ring = (1 - smoothstep(0.01, 0.045, abs(r - 0.98))) * p.sa.x * 0.55;
-                o = mix(o, float4(mix(light, float3(0.94, 0.86, 1), 0.26), 1), ring);
-            }
-        }
         return o;
     }
     """
@@ -391,8 +355,11 @@ final class Liquid {
     static let palette: [SIMD4<Float>] = ["BC82F3", "F5B9EA", "8D9FFF", "FF6778", "FFBA71", "C686FF"].map { h in
         let v = Int(h, radix: 16)!; return SIMD4(Float(v >> 16 & 255) / 255, Float(v >> 8 & 255) / 255, Float(v & 255) / 255, 1) }
     let win: KeyWin, blur = NSVisualEffectView(), glow = Glow(), frost = CALayer()
-    let content = NSView(), title: Line, why: Line, foot: Line, date: Line, clock: Line, button = NSButton()
+    let content = NSView(), portrait = CALayer(), title: Line, why: Line, foot: Line, date: Line, clock: Line, button = NSButton()
     let dayFmt = DateFormatter(), timeFmt = DateFormatter()
+    private var buttonSurface: NSView?
+    private var displayedPortrait: CGImage?
+    private var lastFrost = -1.0
     let main: Bool; var lastShuffle = -10.0, shown = false, lastClock = -10.0
     var from: [SIMD4<Float>] = [], to: [SIMD4<Float>] = [], size = CGSize.zero, frostOpen = true
     init(frame f: NSRect, main: Bool, target: AnyObject, action: Selector) {
@@ -406,25 +373,57 @@ final class Liquid {
         blur.wantsLayer = true; frost.frame = root.bounds; frost.contentsGravity = .resize; blur.layer?.mask = frost
         let host = NSView(frame: root.bounds); host.wantsLayer = true; root.addSubview(host)
         glow.layer.frame = host.bounds; glow.layer.drawableSize = CGSize(width: ceil(W / Glow.scale), height: ceil(H / Glow.scale)); host.layer?.addSublayer(glow.layer)
-        content.frame = root.bounds; root.addSubview(content)
+        content.frame = root.bounds; content.wantsLayer = true; root.addSubview(content)
+        let margin = max(24, min(W, H) * 0.045)
+        let portraitWidth = min(276, min(W * 0.27, H * 0.32))
+        let portraitHeight = portraitWidth * 0.75
+        portrait.frame = NSRect(x: W - margin - portraitWidth, y: H - margin - portraitHeight,
+                                width: portraitWidth, height: portraitHeight)
+        portrait.cornerRadius = 24; portrait.masksToBounds = true
+        portrait.contentsGravity = .resizeAspectFill
+        portrait.minificationFilter = .trilinear
+        portrait.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
+        portrait.borderColor = NSColor.white.withAlphaComponent(0.15).cgColor
+        portrait.borderWidth = 1 / win.backingScaleFactor
+        portrait.transform = CATransform3DMakeScale(-1, 1, 1)
+        portrait.isHidden = true
+        if main { content.layer?.addSublayer(portrait) }
         // the middle belongs to the shape: the time sits in the top left corner, the message in the bottom left one, the action bottom right
-        let m = max(40, W * 0.035), tw = W - 2 * m, ts = min(44, H * 0.055), ws = min(19, H * 0.026), cs = min(34, H * 0.045)
+        let m = max(40, W * 0.035), tw = W - 2 * m, ts = min(44, H * 0.055), ws = min(19, H * 0.026), cs = min(58, H * 0.067)
         var y = m * 0.9
         func up(_ size: CGFloat, gap: CGFloat) -> CGFloat { defer { y += ceil(size * 1.32) + gap }; return y }
         foot = Line(content, x: m, y: up(13, gap: 12), width: tw * 0.6, size: 13, weight: .regular, alpha: 0.8)
         why = Line(content, x: m, y: up(ws, gap: 2), width: tw, size: ws, weight: .medium, alpha: 0.9)
         title = Line(content, x: m, y: up(ts, gap: 0), width: tw, size: ts, weight: .semibold)
         clock = Line(content, x: m, y: H - m * 0.9 - ceil(cs * 1.32), width: tw / 2, size: cs, weight: .semibold, digits: true)
-        date = Line(content, x: m, y: clock.frame.minY - 22, width: tw / 2, size: 15, weight: .medium, alpha: 0.8)
+        date = Line(content, x: m, y: clock.frame.minY - 26, width: tw / 2, size: 17, weight: .medium, alpha: 0.8)
         dayFmt.locale = Locale(identifier: spanish ? "es_ES" : "en_US"); dayFmt.setLocalizedDateFormatFromTemplate("EEEEMMMMd")
         timeFmt.locale = Locale.current; timeFmt.dateFormat = (DateFormatter.dateFormat(fromTemplate: "jmm", options: 0, locale: .current) ?? "H:mm")
             .replacingOccurrences(of: "a", with: "").replacingOccurrences(of: "\u{202F}", with: "").trimmingCharacters(in: .whitespaces)
         if main {
-            button.frame = NSRect(x: W - m - 440, y: m * 0.9, width: 440, height: 40); button.bezelStyle = .rounded; button.controlSize = .large
-            button.font = .systemFont(ofSize: 15, weight: .medium); button.focusRingType = .none
-            button.target = target; button.action = action; content.addSubview(button)
+            let width = min(234, tw * 0.38)
+            let frame = NSRect(x: W - m - width, y: m * 0.9, width: width, height: 48)
+            button.frame = frame; button.bezelStyle = .rounded; button.controlSize = .large
+            button.font = .systemFont(ofSize: 15, weight: .medium)
+            button.target = target; button.action = action
+            if #available(macOS 26.0, *) {
+                let glass = NSGlassEffectView(frame: frame)
+                glass.cornerRadius = 24
+                if #available(macOS 27.0, *) { glass.effectIsInteractive = true }
+                button.isBordered = false
+                button.frame = glass.bounds
+                button.autoresizingMask = [.width, .height]
+                glass.contentView = button
+                buttonSurface = glass
+            } else {
+                buttonSurface = button
+            }
+            if let surface = buttonSurface {
+                surface.wantsLayer = true
+                surface.layer?.opacity = 0
+                content.addSubview(surface)
+            }
         }
-        content.wantsLayer = true; button.wantsLayer = true; button.layer?.opacity = 0
         shuffle(0); from = to
     }
     /// New random stop positions, eased over 9 s, so the colours drift around the edge. A stop is rgb + its place on the circle.
@@ -459,14 +458,14 @@ final class Liquid {
     func reveal(_ on: Bool) {
         guard on != shown else { return }; shown = on
         for (i, v) in [clock, date, title, why, foot].enumerated() { fade(v, on, delay: on ? 0.25 * Double(i) : 0, duration: on ? 2.0 : 0.4) }
-        if button.superview != nil { fade(button, on && button.isEnabled, delay: on ? 0.9 : 0, duration: on ? 0.8 : 0.3) }
+        if let surface = buttonSurface { fade(surface, on && button.isEnabled, delay: 0, duration: on ? 0.45 : 0.25) }
     }
-    func draw(level: Double, t: Double, shape: Silhouette.Preview?) {
+    func draw(level: Double, t: Double, image: CGImage?) {
         if t - lastShuffle > 9 { shuffle(t) }
         let bw = size.width, bh = size.height, short = min(bw, bh)
-        let s = CGFloat(min(1, max(0, level))), ease = s * s * (3 - 2 * s), breathe = CGFloat(0.5 + 0.5 * sin(0.55 * t))
+        let ease = CGFloat(min(1, max(0, level))), breathe = CGFloat(0.5 + 0.5 * sin(0.55 * t))
         let locked = CGFloat(min(1, max(0, (level - 0.88) / 0.12)))
-        let fade = min(1, 6 * s)                                                     // everything eases in from nothing and back out
+        let fade = CGFloat(CoverTiming.visualLevel(min(1, level / 0.24)))                                                     // everything eases in from nothing and back out
         let soft = 30 + 110 * ease                                                   // feather radius grows as the light moves in
         let d = ease * (short / 2 + 1.15 * soft)                                     // how far the front has travelled; closes only at the end
         let a = bw / 2 + soft - d, b = bh / 2 + soft - d
@@ -475,26 +474,44 @@ final class Liquid {
         p.rim = SIMD4(Float(4 + 8 * breathe * (0.4 + 0.6 * locked)), Float(0.7 + 0.45 * ease + 0.2 * locked * breathe), Float(0.8 + 0.4 * ease), Float(t))
         p.opacity = SIMD4(Float(0.92 * locked),                                      // tint: depth behind the message, not a grey dim
                           Float(fade * (0.25 + 0.35 * ease - 0.30 * locked + 0.06 * locked * breathe)),
-                          Float(fade * min(1, 0.6 + 2.5 * s) * (0.85 + 0.15 * breathe)),
-                          Float(0.45 * min(1, 4 * s) * (1 - locked)))                // a faint luminous edge on the front, never a line
-        if main, shown, let shape {
-            let radius = min(66, max(42, short * 0.061))
-            p.frame = SIMD4(Float(bw - radius - 25), Float(bh - radius - 25), Float(radius), 0)
-            p.shapeA = SIMD4(shape.opacity, shape.crop.x, shape.crop.y, shape.crop.z)
+                          Float(fade * min(1, 0.6 + 2.5 * ease) * (0.85 + 0.15 * breathe)),
+                          Float(0.45 * min(1, 4 * ease) * (1 - locked)))                // a faint luminous edge on the front, never a line
+        let colors = stops(t)
+        colors.withUnsafeBytes { bytes in
+            withUnsafeMutableBytes(of: &p.stops) { $0.copyBytes(from: bytes) }
         }
-        let c = stops(t); withUnsafeMutableBytes(of: &p.stops) { $0.copyBytes(from: c.withUnsafeBytes { Array($0) }) }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        blur.alphaValue = fade; drawFrost(p)
+        blur.alphaValue = fade
+        if t - lastFrost >= 1.0 / 22 || (p.front.y <= 4 && frostOpen) {
+            lastFrost = t
+            drawFrost(p)
+        }
+        if main {
+            let visible = shown ? image : nil
+            if displayedPortrait !== visible {
+                if visible == nil { portrait.removeAnimation(forKey: "appear") }
+                let firstImage = displayedPortrait == nil
+                displayedPortrait = visible
+                portrait.contents = visible
+                portrait.isHidden = visible == nil
+                if firstImage, visible != nil {
+                    let appear = CABasicAnimation(keyPath: "opacity")
+                    appear.fromValue = 0; appear.toValue = 1; appear.duration = 0.3
+                    appear.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    portrait.add(appear, forKey: "appear")
+                }
+            }
+        }
         CATransaction.commit()
-        glow.render(p, shape?.texture)
+        glow.render(p)
         if t - lastClock > 1 { lastClock = t; let today = Date(); date.set(dayFmt.string(from: today)); clock.set(timeFmt.string(from: today)) }
-        reveal(level >= (shown ? 0.85 : 0.97))
+        reveal(level >= (shown ? 0.80 : 0.90))
     }
     /// With no corrections left there is no dead button, only the line of text that says so.
     func setButton(_ s: String, enabled: Bool) {
         if button.title != s { button.title = s }
         guard button.isEnabled != enabled else { return }
-        button.isEnabled = enabled; if shown, button.superview != nil { fade(button, enabled, delay: 0, duration: 0.4) }
+        button.isEnabled = enabled; if shown, let surface = buttonSurface { fade(surface, enabled, delay: 0, duration: 0.25) }
     }
 }
 
@@ -517,9 +534,19 @@ final class Guard: NSObject, NSApplicationDelegate {
     var lastCameraRestart = Date.distantPast
     var camera = true, inCall = false, locked = false, poweringOff = false
     private var ownerPreviewVisible = false
+    private var feedbackRequestedUntil = Date.distantPast
+    private let cameraStateLock = NSLock()
+    private var cameraInterval = 0.4, requestPortrait = false
+
+    private func updateCameraSampling() {
+        cameraStateLock.lock()
+        cameraInterval = level == 0 && pBar < RELEASE ? 0.4 : 0.16
+        requestPortrait = level >= 0.95
+        cameraStateLock.unlock()
+    }
     var screenFrames: [NSRect] = [], liquids: [Liquid] = [], hud: NSWindow?, hudText: NSTextField?, keyMonitor: Any?
     var message: (String, String)?, messageAt = Date.distantPast, pendingKey = "", pendingAt = Date.distantPast
-    var blockedSeconds = 0.0, raisedAt = Date.distantPast, wroteAt = Date.distantPast, wroteMode = ""
+    var blockedSeconds = 0.0, wroteAt = Date.distantPast, wroteMode = ""
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let ws = NSWorkspace.shared.notificationCenter
@@ -533,6 +560,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { _ in log("camera runtime error"); self.restartCamera() }
         log("start")
+        DispatchQueue.global(qos: .utility).async { _ = Glow.gpu }
         eye.onSample = { s, frame in
             DispatchQueue.main.async {
                 if let frame {
@@ -540,7 +568,7 @@ final class Guard: NSObject, NSApplicationDelegate {
                        crop.allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
                         silhouette.feed(frame, crop: SIMD3(Float(crop[0]), Float(crop[1]), Float(crop[2])))
                     } else {
-                        silhouette.reject()
+                        silhouette.clear()
                     }
                 }
                 if !s.isEmpty { self.handle(s, Date()) }
@@ -556,7 +584,8 @@ final class Guard: NSObject, NSApplicationDelegate {
         startWatchdog()
         checkCall(); showHUD(); installHotkeys()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in   // while blocked this app has the keyboard: plain G corrects it
-            if self.blocked, e.charactersIgnoringModifiers?.lowercased() == "g" { self.fixClicked() }
+            guard self.blocked else { return e }
+            if e.charactersIgnoringModifiers?.lowercased() == "g" { self.fixClicked() }
             return nil
         }
     }
@@ -610,8 +639,12 @@ final class Guard: NSObject, NSApplicationDelegate {
         out.alwaysDiscardsLateVideoFrames = true
         out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         session.beginConfiguration()
-        if dev.deviceType == .builtInWideAngleCamera, session.canSetSessionPreset(.vga640x480) {
-            session.sessionPreset = .vga640x480
+        if dev.deviceType == .builtInWideAngleCamera {
+            if session.canSetSessionPreset(.hd1280x720) {
+                session.sessionPreset = .hd1280x720
+            } else if session.canSetSessionPreset(.vga640x480) {
+                session.sessionPreset = .vga640x480
+            }
         }
         guard session.canAddInput(input) else {
             session.commitConfiguration()
@@ -645,11 +678,13 @@ final class Guard: NSObject, NSApplicationDelegate {
     }
     func cameraFrame(_ pb: CVPixelBuffer) {
         let now = Date()  // 2.5 frames/s while all is well, 6/s while something looks wrong
-        let interval = level == 0 && pBar < RELEASE ? 0.4 : 0.16
+        cameraStateLock.lock()
+        let interval = cameraInterval, portrait = requestPortrait
+        cameraStateLock.unlock()
         guard now.timeIntervalSince(lastProcessed) > interval else { return }
         if lastProcessed == .distantPast { log("camera delivering frames") }
         lastProcessed = now
-        eye.send(pb, preview: level >= 0.97)
+        eye.send(pb, preview: portrait)
     }
 
     // MARK: judgement -> smoothed p
@@ -662,6 +697,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         if blocked { setBlocked(false) }
         if !liquids.isEmpty { dropLiquids() }
         silhouette.clear(); ownerPreviewVisible = false
+        updateCameraSampling()
     }
     func handle(_ s: [String: Any], _ now: Date) {
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
@@ -704,7 +740,7 @@ final class Guard: NSObject, NSApplicationDelegate {
 
     // MARK: liquid level 0..1, 30 times a second
     func animate() {
-        let now = Date(), dt = min(0.2, now.timeIntervalSince(lastAnim)); lastAnim = now
+        let now = Date(), dt = min(0.1, max(0, now.timeIntervalSince(lastAnim))); lastAnim = now
         beatLock.lock(); beat = ProcessInfo.processInfo.systemUptime; beatLock.unlock()
         let motion = coverTiming.motion(at: now, covering: level > 0)
         let good = motion == .drain || locked
@@ -721,6 +757,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         if level >= 1, !blocked { setBlocked(true) } else if level < 0.97, blocked { releasing = true; setBlocked(false) }
         if blocked { blockedSeconds += dt }
+        updateCameraSampling()
         if level <= 0 { silhouette.clear(); ownerPreviewVisible = false; message = nil; if !liquids.isEmpty { dropLiquids() }; return }
         if liquids.isEmpty {
             screenFrames = NSScreen.screens.map(\.frame)
@@ -728,10 +765,10 @@ final class Guard: NSObject, NSApplicationDelegate {
             liquids.forEach { $0.win.ignoresMouseEvents = !blocked; $0.win.orderFrontRegardless() }
         }
         let t = now.timeIntervalSince(t0)
-        let shape = silhouette.texture()
-        ownerPreviewVisible = shape != nil && liquids.contains { $0.main && $0.shown }
+        let image = blocked ? silhouette.image() : nil
         let visualLevel = CoverTiming.visualLevel(level)
-        for l in liquids { l.draw(level: visualLevel, t: t, shape: shape) }
+        for l in liquids { l.draw(level: visualLevel, t: t, image: image) }
+        ownerPreviewVisible = image != nil && liquids.contains { $0.main && !$0.portrait.isHidden }
     }
     func dropLiquids() { liquids.forEach { $0.win.orderOut(nil) }; liquids = [] }
     func setBlocked(_ on: Bool) {
@@ -741,6 +778,7 @@ final class Guard: NSObject, NSApplicationDelegate {
             log("BAD \(reason) p=\(f2(pBar)) \(brief(lastSample))")
             NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
             NSApp.presentationOptions = [.hideDock, .hideMenuBar, .disableProcessSwitching, .disableForceQuit, .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
+            (liquids.first { $0.main } ?? liquids.first)?.win.makeKey()
         } else {
             log("ok p=\(f2(pBar)) \(brief(lastSample))")
             NSApp.presentationOptions = []
@@ -748,12 +786,11 @@ final class Guard: NSObject, NSApplicationDelegate {
     }
 
     // MARK: teaching and corrections
-    // "good"/"bad": the last 4 s and next 6 s become posture examples (postura-eye.py). "good" while it says bad is a
-    // correction: it also drains the liquid, limited per day so it cannot be used to slouch all day.
+    // Feedback collects six seconds of live posture or eyewear measurements.
     var glassesWarning: Bool { reasonKind == "glasses" || reasonKind == "sunglasses" }
     @objc func fixClicked() { teach(glassesWarning ? "gafas" : "good") }
     func teach(_ label: String) {
-        guard (lastSample["training"] as? String ?? "").isEmpty else { return }
+        guard Date() >= feedbackRequestedUntil, (lastSample["training"] as? String ?? "").isEmpty else { return }
         let eyewear = label == "gafas" || label == "singafas"
         guard lastSample["face"] as? Bool == true,
               (eyewear || lastSample["body"] as? Bool == true),
@@ -766,6 +803,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         do {
             try label.write(to: trainURL, atomically: true, encoding: .utf8)
             log("LABEL \(label) p=\(f2(pBar)) \(brief(lastSample))")
+            feedbackRequestedUntil = Date().addingTimeInterval(1.25)
             flash(L("Preparando el ejemplo…", "Getting ready to record…"))
         } catch {
             flash(L("No se pudo guardar el ejemplo", "Could not save feedback"))
@@ -823,14 +861,22 @@ final class Guard: NSObject, NSApplicationDelegate {
         if level > 0, message == nil || level < 0.9 || (now.timeIntervalSince(pendingAt) >= 4 && now.timeIntervalSince(messageAt) >= 12), message?.0 != head || message?.1 != line {
             message = (head, line); messageAt = now
         }
+        let recording = lastSample["training"] as? String ?? ""
+        let remaining = (lastSample["trainingRemaining"] as? NSNumber)?.doubleValue ?? 0
         for l in liquids {
             l.title.set(message?.0 ?? head); l.why.set(message?.1 ?? line)
-            l.setButton(glassesWarning ? L("Llevo mis gafas", "I’m wearing my glasses") : L("Mi postura es buena", "My posture is good"), enabled: true)
-            l.foot.set("")
+            let ready = recording.isEmpty && now >= feedbackRequestedUntil
+            let action = glassesWarning ? L("Llevo mis gafas", "I’m wearing my glasses") : L("Mi postura es buena", "My posture is good")
+            l.setButton(action, enabled: ready)
+            if !recording.isEmpty && remaining > 0 {
+                l.foot.set(L("Mantén la posición", "Hold your position") + " · \(Int(ceil(remaining))) s")
+            } else {
+                l.foot.set(now < noteUntil ? note : "")
+            }
         }
-        if blocked, let w = (liquids.first { $0.main } ?? liquids.first)?.win, !NSApp.isActive || !w.isKeyWindow || now.timeIntervalSince(raisedAt) > 3 {
-            raisedAt = now; if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }     // only when something took the front; repeating it is slow
-            liquids.forEach { $0.win.orderFrontRegardless() }; w.makeKey()
+        if blocked, let w = (liquids.first { $0.main } ?? liquids.first)?.win, !NSApp.isActive || !w.isKeyWindow {
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            w.makeKeyAndOrderFront(nil)
         }
         var text = "", color = NSColor.systemGreen
         if now < noteUntil { text = note; color = .systemYellow }
@@ -917,6 +963,13 @@ struct CameraPreview: NSViewRepresentable {
     func updateNSView(_ view: NSView, context: Context) {}
 }
 
+private extension View {
+    @ViewBuilder func glassControl() -> some View {
+        if #available(macOS 26.0, *) { buttonStyle(.glass) }
+        else { buttonStyle(.bordered) }
+    }
+}
+
 struct ExampleButton: View {
     let label: String
     let icon: String
@@ -935,6 +988,7 @@ struct ExampleButton: View {
             }
             .frame(maxWidth: .infinity)
         }
+        .glassControl()
         .controlSize(.large)
         .overlay {
             if selected {
@@ -961,7 +1015,7 @@ struct PosturaView: View {
                 Button { model.settingsPresented = true } label: {
                     Label(L("Ajustes", "Settings"), systemImage: "gearshape")
                 }
-                .buttonStyle(.borderless)
+                .glassControl()
                 .keyboardShortcut(",", modifiers: .command)
             }
 
