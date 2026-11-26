@@ -358,77 +358,100 @@ final class GlassPortrait {
         layer.frame = frame
         layer.isHidden = true
         let bounds = layer.bounds
-        let path = Self.outline(in: bounds.insetBy(dx: 3, dy: 3))
-
-        func shape() -> CAShapeLayer {
-            let mask = CAShapeLayer()
-            mask.frame = bounds
-            mask.path = path
-            mask.contentsScale = scale
-            return mask
-        }
-
-        func gradient(_ colors: [NSColor], _ stops: [NSNumber]) -> CAGradientLayer {
-            let glass = CAGradientLayer()
-            glass.frame = bounds
-            glass.contentsScale = scale
-            glass.startPoint = CGPoint(x: 0.14, y: 1)
-            glass.endPoint = CGPoint(x: 0.83, y: 0)
-            glass.colors = colors.map(\.cgColor)
-            glass.locations = stops
-            return glass
-        }
-
-        layer.shadowColor = NSColor.black.cgColor
-        layer.shadowOpacity = 0.32
-        layer.shadowOffset = CGSize(width: 1, height: -9)
-        layer.shadowRadius = 16
-        layer.shadowPath = path
-
-        let tint = gradient([
-            .white.withAlphaComponent(0.30),
-            NSColor(srgbRed: 0.64, green: 0.60, blue: 0.77, alpha: 0.16),
-            NSColor(srgbRed: 0.09, green: 0.07, blue: 0.19, alpha: 0.25),
-            .white.withAlphaComponent(0.13)
-        ], [0, 0.32, 0.68, 1])
-        tint.mask = shape()
-        layer.addSublayer(tint)
+        let path = Self.outline(in: bounds.insetBy(dx: 9, dy: 9))
+        let glass = CALayer()
+        glass.frame = bounds
+        glass.contentsScale = scale
+        glass.contents = Self.surface(in: bounds, outline: path, scale: scale)
+        glass.shadowColor = NSColor.black.cgColor
+        glass.shadowOpacity = 0.22
+        glass.shadowOffset = CGSize(width: 4, height: -9)
+        glass.shadowRadius = 18
+        glass.shadowPath = path
+        layer.addSublayer(glass)
 
         let contents = CALayer()
         contents.frame = bounds
-        contents.mask = shape()
-        video.frame = bounds.insetBy(dx: bounds.width * 0.10, dy: bounds.height * 0.055)
+        let outline = CAShapeLayer()
+        outline.frame = bounds
+        outline.path = path
+        outline.contentsScale = scale
+        contents.mask = outline
+
+        let width = bounds.width * 0.79
+        video.frame = CGRect(x: bounds.midX - width / 2, y: bounds.height * 0.10,
+                             width: width, height: bounds.height * 0.81)
         video.contentsGravity = .resizeAspect
         video.minificationFilter = .trilinear
         video.transform = CATransform3DMakeScale(-1, 1, 1)
+        let lowerFade = CAGradientLayer()
+        lowerFade.frame = video.bounds
+        lowerFade.startPoint = CGPoint(x: 0.5, y: 0)
+        lowerFade.endPoint = CGPoint(x: 0.5, y: 1)
+        lowerFade.colors = [NSColor.clear.cgColor, NSColor.white.cgColor, NSColor.white.cgColor]
+        lowerFade.locations = [0.05, 0.29, 1]
+        video.mask = lowerFade
         contents.addSublayer(video)
         layer.addSublayer(contents)
-
-        let rim = gradient([
-            .white.withAlphaComponent(0.95),
-            NSColor(srgbRed: 0.80, green: 0.87, blue: 1, alpha: 0.56),
-            .white.withAlphaComponent(0.12),
-            NSColor(srgbRed: 0.92, green: 0.81, blue: 1, alpha: 0.52)
-        ], [0, 0.26, 0.59, 1])
-        let stroke = shape()
-        stroke.fillColor = nil
-        stroke.strokeColor = NSColor.white.cgColor
-        stroke.lineWidth = 1.5
-        rim.mask = stroke
-        layer.addSublayer(rim)
     }
 
-    /// A wide, asymmetric silhouette keeps the shoulders in view without a circular crop.
+    private static func surface(in bounds: CGRect, outline: CGPath, scale: CGFloat) -> CGImage? {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let context = CGContext(data: nil, width: Int(ceil(bounds.width * scale)),
+                                      height: Int(ceil(bounds.height * scale)), bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.scaleBy(x: scale, y: scale)
+        let ice = NSColor(srgbRed: 0.83, green: 0.94, blue: 1, alpha: 1)
+        let pearl = NSColor(srgbRed: 1, green: 0.93, blue: 0.86, alpha: 1)
+
+        func light(_ color: NSColor, _ strength: CGFloat, x: CGFloat, y: CGFloat, reach: CGFloat) {
+            let colors = [color.withAlphaComponent(strength).cgColor,
+                          color.withAlphaComponent(strength * 0.38).cgColor,
+                          color.withAlphaComponent(0).cgColor]
+            guard let gradient = CGGradient(colorsSpace: space, colors: colors as CFArray, locations: [0, 0.38, 1]) else { return }
+            let center = CGPoint(x: bounds.width * x, y: bounds.height * y)
+            context.drawRadialGradient(gradient, startCenter: center, startRadius: 0, endCenter: center,
+                                       endRadius: bounds.width * reach, options: [])
+        }
+
+        // A translucent body with separate pockets of light, like reflections on a curved surface.
+        context.saveGState()
+        context.addPath(outline)
+        context.clip()
+        context.setFillColor(NSColor(srgbRed: 0.13, green: 0.10, blue: 0.23, alpha: 0.24).cgColor)
+        context.fill(bounds)
+        light(ice, 0.32, x: 0.30, y: 0.93, reach: 0.46)
+        light(pearl, 0.28, x: 0.70, y: 0.12, reach: 0.33)
+        light(.white, 0.13, x: 0.86, y: 0.57, reach: 0.22)
+        context.restoreGState()
+
+        // Spread the reflections around short arcs and leave the rest of the rim quiet.
+        for (width, strength): (CGFloat, CGFloat) in [(20, 0.045), (12, 0.055), (6, 0.10), (1.5, 0.90)] {
+            context.saveGState()
+            context.addPath(outline.copy(strokingWithWidth: width, lineCap: .round, lineJoin: .round, miterLimit: 1))
+            context.clip()
+            light(ice, strength, x: 0.34, y: 0.93, reach: 0.38)
+            light(pearl, strength * 0.76, x: 0.69, y: 0.11, reach: 0.24)
+            light(.white, strength * 0.34, x: 0.86, y: 0.65, reach: 0.21)
+            context.restoreGState()
+        }
+        return context.makeImage()
+    }
+
+    /// An off-axis droplet with curved sides and a fuller upper-left shoulder.
     private static func outline(in rect: CGRect) -> CGPath {
         func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
             CGPoint(x: rect.minX + x * rect.width, y: rect.minY + y * rect.height)
         }
         let path = CGMutablePath()
-        path.move(to: p(0.46, 0.98))
-        path.addCurve(to: p(0.98, 0.54), control1: p(0.76, 1.04), control2: p(0.97, 0.88))
-        path.addCurve(to: p(0.63, 0.025), control1: p(1.00, 0.22), control2: p(0.85, 0.04))
-        path.addCurve(to: p(0.025, 0.44), control1: p(0.30, -0.005), control2: p(0.04, 0.09))
-        path.addCurve(to: p(0.46, 0.98), control1: p(0.007, 0.75), control2: p(0.14, 0.92))
+        path.move(to: p(0.36, 0.99))
+        path.addCurve(to: p(0.86, 0.72), control1: p(0.55, 1.00), control2: p(0.74, 0.89))
+        path.addCurve(to: p(0.95, 0.34), control1: p(0.94, 0.61), control2: p(0.99, 0.48))
+        path.addCurve(to: p(0.67, 0.035), control1: p(0.90, 0.17), control2: p(0.81, 0.058))
+        path.addCurve(to: p(0.19, 0.22), control1: p(0.50, 0.007), control2: p(0.31, 0.090))
+        path.addCurve(to: p(0.035, 0.63), control1: p(0.085, 0.34), control2: p(0.012, 0.49))
+        path.addCurve(to: p(0.36, 0.99), control1: p(0.062, 0.81), control2: p(0.16, 0.979))
         path.closeSubpath()
         return path
     }
@@ -478,7 +501,7 @@ final class Liquid {
         content.frame = root.bounds; content.wantsLayer = true; root.addSubview(content)
         let margin = max(24, min(W, H) * 0.045)
         let portraitWidth = min(320, min(W * 0.30, H * 0.39))
-        let portraitHeight = portraitWidth * 0.76
+        let portraitHeight = portraitWidth * 0.88
         portrait = GlassPortrait(frame: NSRect(x: W - margin - portraitWidth, y: H - margin - portraitHeight,
                                               width: portraitWidth, height: portraitHeight),
                                  scale: win.backingScaleFactor)
