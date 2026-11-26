@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Postura · A posture coach for your Mac</title>
+  <meta name="description" content="Postura helps you notice when you slouch. A gentle screen cover builds gradually and clears as you sit up. Free, open source, and on-device.">
+  <meta name="theme-color" content="#0f1119">
+  <link rel="canonical" href="https://postura.megawebs.com/">
+  <link rel="icon" href="/app-icon.png" type="image/png">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/site.js"></script>
+</head>
+<body>
+  <header class="wrap top">
+    <a class="brand" href="/" aria-label="Postura home"><img src="/app-icon.png" alt="" width="34" height="34">Postura</a>
+    <nav aria-label="Main"><a href="#how">How it works</a><a href="#install">Install</a><a href="https://github.com/samihalawa/postura">GitHub ↗</a></nav>
+  </header>
+  <main>
+    <section class="wrap hero">
+      <div class="intro">
+        <p class="eyebrow">A POSTURE COACH FOR MAC</p>
+        <h1>Catch the slouch.<br><em>Sit a little taller.</em></h1>
+        <p class="summary">Postura notices when you slouch and gradually covers your screen. Sit up and the cover eases away. The camera and posture analysis stay on your Mac.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/samihalawa/postura/releases/download/v1.6.5/Postura-1.6.5.zip">Download for Mac <span aria-hidden="true">↓</span></a>
+          <a class="button secondary" href="#how">See how it works</a>
+        </div>
+        <p class="requirements">macOS 14+ · Apple silicon and Intel · Free and open source</p>
+      </div>
+      <figure class="demo" aria-label="Illustration of Postura's gradual screen cover">
+        <div class="demo-bar"><span></span><span></span><span></span></div>
+        <div class="demo-screen" aria-hidden="true">
+          <div class="demo-clock">9:41<small>Thursday, November 26</small></div>
+          <div class="lens"><div class="person"></div></div>
+          <div class="demo-copy">Sit up straight<small>Hold your corrected posture</small></div>
+          <div class="demo-action">My posture is good</div>
+        </div>
+        <figcaption>Illustration of the posture cover</figcaption>
+      </figure>
+    </section>
+    <section class="wrap section" id="how">
+      <div class="section-head"><p class="eyebrow">HOW IT WORKS</p><h2>A pause you can feel.</h2></div>
+      <div class="steps">
+        <article><h3>It waits for a sustained slouch.</h3><p>A brief movement won’t start the cover. After five seconds of clearly bad posture, a soft glow begins to close in.</p></article>
+        <article><h3>Sit up to clear the screen.</h3><p>The cover recedes once you correct your posture. If you step out of frame, the screen clears immediately.</p></article>
+        <article><h3>Teach it what feels right.</h3><p>Use the Dock window to label your good and bad posture live. Postura uses those examples to personalise its judgments.</p></article>
+      </div>
+    </section>
+    <section class="wrap section install" id="install">
+      <div><p class="eyebrow">INSTALL</p><h2>Start on your Mac.</h2><p>Open Postura and allow camera access. The first launch sets up the local posture model. The Dock opens the live camera, feedback and settings.</p><a class="button primary" href="https://github.com/samihalawa/postura/releases/download/v1.6.5/Postura-1.6.5.zip">Download for Mac <span aria-hidden="true">↓</span></a></div>
+      <div class="methods">
+        <div class="method"><h3>Homebrew</h3><div class="command"><code>brew install --cask samihalawa/tap/postura</code><button type="button" hidden>Copy</button></div></div>
+        <div class="method"><h3>Shell installer</h3><div class="command"><code>curl -fsSL https://raw.githubusercontent.com/samihalawa/postura/main/install.sh | sh</code><button type="button" hidden>Copy</button></div></div>
+        <a href="https://github.com/samihalawa/postura/releases/latest">Release notes and checksums ↗</a>
+      </div>
+    </section>
+    <section class="wrap section questions" id="faq">
+      <div><p class="eyebrow">QUESTIONS</p><h2>Good to know.</h2></div>
+      <div>
+        <details><summary>Are any camera frames saved or sent?</summary><p>Postura processes frames on your Mac. It keeps numerical posture examples locally when you label an example.</p></details>
+        <details><summary>What happens during video calls?</summary><p>When Postura detects a call, it limits the reminder to a faint edge glow.</p></details>
+        <details><summary>Can Postura remind me to wear my glasses?</summary><p>Yes. Turn on Require glasses in Settings and record a live sample with and without your glasses.</p></details>
+        <details><summary>Where is the source code?</summary><p>Postura is MIT-licensed. See the <a href="https://github.com/samihalawa/postura">GitHub repository</a> for the code, build instructions and issue tracker.</p></details>
+      </div>
+    </section>
+  </main>
+  <footer class="wrap bottom"><a class="brand" href="/"><img src="/app-icon.png" alt="" width="28" height="28">Postura</a><a href="https://github.com/samihalawa/postura/blob/main/LICENSE">MIT License ↗</a></footer>
+</body>
+</html>
