@@ -1,7 +1,7 @@
 // Postura: camera posture guard for macOS. Clearly bad posture makes a glowing front close in
 // over every display; when it has covered the screen, mouse, keyboard, Cmd-Tab and Force Quit are blocked until the posture
 // is fixed. The judgement (p = 0..1 bad, why) comes from postura-eye.py; this app owns the camera, the timing and the screens.
-// Posture coaching clears an empty frame. An explicitly confirmed Forced Rest uses its own countdown.
+// Posture coaching clears an empty frame. An explicitly confirmed Timed Lock uses its own countdown.
 import AppKit
 import Metal
 import QuartzCore
@@ -618,9 +618,18 @@ final class Liquid {
     }
 }
 
-struct ForcedRest: Codable {
-    static let manualHours = 3
-    private static let maximumSeconds = 8.0 * 3600
+struct TimedLock: Codable {
+    static let defaultMinutes = 180
+    static let maximumMinutes = 30 * 60
+    static let presets = [5, 15, 30, 60, 120, 180, 360, 1800]
+    private static let maximumSeconds = Double(maximumMinutes * 60)
+
+    static func durationLabel(_ minutes: Int) -> String {
+        let hours = minutes / 60, remainder = minutes % 60
+        if hours == 0 { return "\(remainder) min" }
+        if remainder == 0 { return "\(hours) h" }
+        return "\(hours) h \(remainder) min"
+    }
     static let file = supportDir.appendingPathComponent("forced-rest.json")
     static let bootID: String? = {
         var size = 0
@@ -634,22 +643,22 @@ struct ForcedRest: Codable {
     let elapsedDeadline: Double
     let boot: String?
 
-    init(seconds: Double, now: Date = Date(), elapsed: Double = ForcedRest.elapsedTime(),
-         boot: String? = ForcedRest.bootID) {
+    init(seconds: Double, now: Date = Date(), elapsed: Double = TimedLock.elapsedTime(),
+         boot: String? = TimedLock.bootID) {
         deadline = now.addingTimeInterval(seconds)
         elapsedDeadline = elapsed + seconds
         self.boot = boot
     }
 
-    func remaining(now: Date = Date(), elapsed: Double = ForcedRest.elapsedTime(),
-                   bootID: String? = ForcedRest.bootID) -> Double {
+    func remaining(now: Date = Date(), elapsed: Double = TimedLock.elapsedTime(),
+                   bootID: String? = TimedLock.bootID) -> Double {
         let seconds = boot != nil && boot == bootID ? elapsedDeadline - elapsed : deadline.timeIntervalSince(now)
         return min(Self.maximumSeconds, max(0, seconds))
     }
 
     func save() throws { try JSONEncoder().encode(self).write(to: Self.file, options: .atomic) }
 
-    static func load() -> ForcedRest? {
+    static func load() -> TimedLock? {
         guard let data = try? Data(contentsOf: file),
               let stored = try? JSONDecoder().decode(Self.self, from: data) else { return nil }
         let seconds = stored.remaining()
@@ -668,23 +677,65 @@ struct ForcedRest: Codable {
     }
 }
 
-enum DailyRest {
-    static let preference = "dailyForcedRest"
+struct TimedLockSchedule: Equatable {
+    private static let key = "timedLockSchedule"
+    private static let minutesPerDay = 24 * 60
+    var enabled: Bool
+    var start: Int
+    var end: Int
 
-    static func window(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> DateInterval? {
-        guard let start = calendar.date(bySettingHour: 1, minute: 0, second: 0, of: date),
-              let end = calendar.date(bySettingHour: 4, minute: 0, second: 0, of: date),
-              start < end else { return nil }
-        return DateInterval(start: start, end: end)
+    var isValid: Bool {
+        (0..<Self.minutesPerDay).contains(start) && (0..<Self.minutesPerDay).contains(end) && start != end
     }
 
-    static func remaining(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> Double? {
-        guard let window = window(at: date, calendar: calendar), date >= window.start, date < window.end else { return nil }
-        return window.end.timeIntervalSince(date)
+    static func load() -> Self {
+        if let values = prefs.dictionary(forKey: key),
+           let enabled = values["enabled"] as? Bool,
+           let start = values["start"] as? Int,
+           let end = values["end"] as? Int {
+            let schedule = Self(enabled: enabled, start: start, end: end)
+            if schedule.isValid { return schedule }
+        }
+        return Self(enabled: prefs.bool(forKey: "dailyForcedRest"), start: 60, end: 240)
+    }
+
+    func save() {
+        guard isValid else { return }
+        prefs.set(["enabled": enabled, "start": start, "end": end], forKey: Self.key)
+    }
+
+    func remaining(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> Double? {
+        guard enabled, isValid else { return nil }
+        let today = calendar.startOfDay(for: date)
+        let previous = calendar.date(byAdding: .day, value: -1, to: today)
+        for day in [today, previous].compactMap({ $0 }) {
+            let endDay = start > end ? calendar.date(byAdding: .day, value: 1, to: day) : day
+            guard let endDay,
+                  let begins = calendar.date(bySettingHour: start / 60, minute: start % 60, second: 0, of: day,
+                                             matchingPolicy: .nextTime, repeatedTimePolicy: .first),
+                  let ends = calendar.date(bySettingHour: end / 60, minute: end % 60, second: 0, of: endDay,
+                                           matchingPolicy: .nextTime, repeatedTimePolicy: .last),
+                  calendar.isDate(begins, inSameDayAs: day), calendar.isDate(ends, inSameDayAs: endDay),
+                  date >= begins, date < ends else { continue }
+            return ends.timeIntervalSince(date)
+        }
+        return nil
+    }
+
+    static func pickerDate(_ minutes: Int) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .autoupdatingCurrent
+        return calendar.date(from: DateComponents(year: 2025, month: 1, day: 15,
+                                                  hour: minutes / 60, minute: minutes % 60)) ?? Date()
+    }
+
+    static func minutes(of date: Date) -> Int {
+        let components = Calendar.autoupdatingCurrent.dateComponents([.hour, .minute], from: date)
+        return (components.hour ?? 0) * 60 + (components.minute ?? 0)
     }
 }
 
-final class RestCover {
+final class TimedLockCover {
     let window: KeyWin
     let countdown = NSTextField(labelWithString: "")
 
@@ -696,7 +747,7 @@ final class RestCover {
         window.backgroundColor = NSColor(srgbRed: 0.065, green: 0.06, blue: 0.11, alpha: 1)
         window.hasShadow = false
 
-        let title = NSTextField(labelWithString: L("Descanso forzado", "Forced Rest"))
+        let title = NSTextField(labelWithString: L("Bloqueo temporal", "Timed Lock"))
         title.font = .systemFont(ofSize: 38, weight: .semibold)
         title.textColor = .white
         countdown.font = .monospacedDigitSystemFont(ofSize: 20, weight: .medium)
@@ -719,7 +770,7 @@ final class RestCover {
     }
 
     func update(seconds: Double) {
-        let value = ForcedRest.countdown(seconds)
+        let value = TimedLock.countdown(seconds)
         if countdown.stringValue != value { countdown.stringValue = value }
     }
 }
@@ -746,9 +797,9 @@ final class Guard: NSObject, NSApplicationDelegate {
     private var feedbackRequestedUntil = Date.distantPast
     private let cameraStateLock = NSLock()
     private var cameraInterval = 0.4, requestPortrait = false, suspendAnalysis = false
-    private(set) var rest: ForcedRest?
+    private(set) var rest: TimedLock?
     private var cameraRequested = false
-    private var restCovers: [RestCover] = []
+    private var restCovers: [TimedLockCover] = []
     private var restFrames: [NSRect] = []
 
     private func updateCameraSampling() {
@@ -790,8 +841,8 @@ final class Guard: NSObject, NSApplicationDelegate {
                 else { self.revealScreen("camera analysis failed") }
             }
         }
-        rest = ForcedRest.load()
-        checkDailyRest(at: Date())
+        rest = TimedLock.load()
+        checkTimedLockSchedule(at: Date())
         updateCameraSampling()
         shell.start()
         if let rest { showRest(seconds: rest.remaining()) }
@@ -1021,30 +1072,29 @@ final class Guard: NSObject, NSApplicationDelegate {
                                      .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
     }
 
-    func startRest() throws {
-        guard rest == nil else { return }
-        try applyRest(ForcedRest(seconds: Double(ForcedRest.manualHours * 3600)))
-        log("manual forced rest started for \(ForcedRest.manualHours) h")
+    func startTimedLock(minutes: Int) throws {
+        guard rest == nil, (1...TimedLock.maximumMinutes).contains(minutes) else { return }
+        try applyRest(TimedLock(seconds: Double(minutes * 60)))
+        log("timed lock started for \(TimedLock.durationLabel(minutes))")
         tick()
     }
 
-    private func checkDailyRest(at now: Date) {
-        guard prefs.bool(forKey: DailyRest.preference),
-              let seconds = DailyRest.remaining(at: now),
-              (rest?.remaining(now: now) ?? 0) + 1 < seconds else { return }
+    private func checkTimedLockSchedule(at now: Date) {
+        guard let seconds = TimedLockSchedule.load().remaining(at: now) else { return }
+        if let rest, rest.remaining(now: now) + 1 >= seconds { return }
         do {
-            try applyRest(ForcedRest(seconds: seconds, now: now))
-            log("daily forced rest active")
+            try applyRest(TimedLock(seconds: seconds, now: now))
+            log("scheduled timed lock active")
         } catch {
             // Retry on the next status tick without leaving the session in a partially applied state.
-            if wroteMode != "daily-rest-error" { log("could not save daily forced rest: \(error)") }
+            if wroteMode != "daily-rest-error" { log("could not save scheduled timed lock: \(error)") }
             writeStatus(now, mode: "daily-rest-error")
         }
     }
 
-    private func applyRest(_ session: ForcedRest) throws {
+    private func applyRest(_ session: TimedLock) throws {
         try session.save()
-        if rest == nil { revealScreen("forced rest started") }
+        if rest == nil { revealScreen("timed lock started") }
         rest = session
         updateCameraSampling()
         queue.async { if self.session.isRunning { self.session.stopRunning() } }
@@ -1058,7 +1108,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         if restFrames != frames {
             let previous = restCovers
             restFrames = frames
-            restCovers = screens.map { RestCover(screen: $0) }
+            restCovers = screens.map { TimedLockCover(screen: $0) }
             for cover in restCovers {
                 cover.update(seconds: seconds)
                 cover.window.orderFrontRegardless()
@@ -1074,15 +1124,15 @@ final class Guard: NSObject, NSApplicationDelegate {
 
     private func endRest() {
         rest = nil
-        try? fm.removeItem(at: ForcedRest.file)
+        try? fm.removeItem(at: TimedLock.file)
         NSApp.presentationOptions = []
         restCovers.forEach { $0.window.orderOut(nil) }
         restCovers = []
         restFrames = []
-        revealScreen("forced rest ended")
+        revealScreen("timed lock ended")
         if cameraRequested { restartCamera() }
         else { requestCamera() }
-        log("forced rest ended")
+        log("timed lock ended")
     }
 
     // MARK: teaching and corrections
@@ -1143,7 +1193,7 @@ final class Guard: NSObject, NSApplicationDelegate {
     func tick() {
         let now = Date()
         locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
-        checkDailyRest(at: now)
+        checkTimedLockSchedule(at: now)
         if let rest {
             let seconds = rest.remaining(now: now)
             showRest(seconds: seconds)
@@ -1220,7 +1270,9 @@ final class Guard: NSObject, NSApplicationDelegate {
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         st["ownerPreview"] = ownerPreviewVisible
         st["camera"] = cameraName
-        st["dailyForcedRest"] = prefs.bool(forKey: DailyRest.preference)
+        let schedule = TimedLockSchedule.load()
+        st["dailyForcedRest"] = schedule.enabled
+        st["dailyTimedLock"] = ["enabled": schedule.enabled, "startMinute": schedule.start, "endMinute": schedule.end]
         st.merge(extra) { _, new in new }
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL, options: .atomic) }
     }
@@ -1408,58 +1460,103 @@ struct PosturaView: View {
     }
 }
 
-struct ForcedRestSettingsView: View {
+struct TimedLockSettingsView: View {
+    private static let custom = 0
+    @State private var selection = TimedLock.defaultMinutes
+    @State private var customMinutes: Int? = TimedLock.defaultMinutes
+    @State private var reviewedMinutes = TimedLock.defaultMinutes
+    @State private var schedule = TimedLockSchedule.load()
+    @State private var savedSchedule = TimedLockSchedule.load()
     @State private var confirmation = false
     @State private var saveFailed = false
-    @State private var confirmDailyRest = false
-    @AppStorage(DailyRest.preference) private var dailyRestEnabled = false
+    @State private var confirmSchedule = false
     @Environment(\.dismiss) private var dismiss
+
+    private var minutes: Int { selection == Self.custom ? customMinutes ?? 0 : selection }
+    private var validDuration: Bool { (1...TimedLock.maximumMinutes).contains(minutes) }
+
+    private func time(_ path: WritableKeyPath<TimedLockSchedule, Int>) -> Binding<Date> {
+        Binding(get: { TimedLockSchedule.pickerDate(schedule[keyPath: path]) },
+                set: { schedule[keyPath: path] = TimedLockSchedule.minutes(of: $0) })
+    }
+
+    private var scheduleLabel: String {
+        "\(TimedLockSchedule.pickerDate(schedule.start).formatted(date: .omitted, time: .shortened))–\(TimedLockSchedule.pickerDate(schedule.end).formatted(date: .omitted, time: .shortened))"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(L("Descanso forzado", "Forced Rest")).font(.title2.bold())
-            Text(L("Cubre todas las pantallas durante tres horas, incluso si no hay nadie ante la cámara.",
-                   "Cover every display for three hours, even when nobody is in front of the camera."))
-            Divider()
-            Toggle(L("Cada día, 1:00–4:00", "Daily, 1:00–4:00 a.m."), isOn: Binding(
-                get: { dailyRestEnabled },
-                set: { enabled in
-                    if enabled { confirmDailyRest = true }
-                    else { dailyRestEnabled = false }
+            Text(L("Bloqueo temporal", "Timed Lock")).font(.title2.bold())
+            Text(L("Cubre todas las pantallas hasta que termine la cuenta, sin opción para salir antes desde Postura.",
+                   "Cover every display until the countdown ends. There’s no early exit in Postura."))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Picker(L("Duración", "Duration"), selection: $selection) {
+                    ForEach(TimedLock.presets, id: \.self) { Text(TimedLock.durationLabel($0)).tag($0) }
+                    Text(L("Personalizada…", "Custom…")).tag(Self.custom)
                 }
-            ))
-            Text(L("Se aplica en la hora local. Puedes empezar un descanso manual antes.",
-                   "Uses local time. You can start a manual rest earlier."))
+                .fixedSize()
+                Spacer()
+                Button(L("Revisar bloqueo…", "Review lock…")) {
+                    reviewedMinutes = minutes
+                    confirmation = true
+                }
+                .disabled(!validDuration)
+            }
+            if selection == Self.custom {
+                TextField(L("Minutos (1–1800)", "Minutes (1–1800)"), value: $customMinutes, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                if !validDuration {
+                    Text(L("Introduce de 1 a 1800 minutos.", "Enter a duration from 1 to 1,800 minutes."))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+            Toggle(L("Horario diario", "Daily schedule"), isOn: $schedule.enabled)
+            HStack(spacing: 20) {
+                DatePicker(L("Desde", "From"), selection: time(\.start), displayedComponents: .hourAndMinute)
+                DatePicker(L("Hasta", "Until"), selection: time(\.end), displayedComponents: .hourAndMinute)
+            }
+            .disabled(!schedule.enabled)
+            Text(!schedule.isValid && schedule.enabled
+                 ? L("Elige horas diferentes.", "Choose different start and end times.")
+                 : L("Hora local del Mac. Puedes elegir un intervalo que cruce medianoche.",
+                     "Your Mac’s local time. The schedule can cross midnight."))
                 .font(.caption).foregroundStyle(.secondary)
-            Text(L("Cuando empiece, Postura no ofrecerá una opción para terminar antes.",
-                   "Once the rest starts, Postura provides no way to end it early."))
-                .font(.callout).foregroundStyle(.secondary)
+
             HStack {
                 Button(L("Volver", "Back")) { dismiss() }
                 Spacer()
-                Button(L("Revisar descanso de 3 h…", "Review 3-hour rest…")) { confirmation = true }
+                Button(L("Guardar horario", "Save schedule")) {
+                    if schedule.enabled { confirmSchedule = true }
+                    else { schedule.save(); savedSchedule = schedule }
+                }
+                .disabled(schedule == savedSchedule || !schedule.isValid)
             }
         }
         .padding(24)
-        .frame(width: 390)
-        .alert(L("¿Iniciar descanso forzado de 3 horas?", "Start a 3-hour Forced Rest?"), isPresented: $confirmation) {
+        .frame(width: 430)
+        .alert(L("¿Iniciar bloqueo de \(TimedLock.durationLabel(reviewedMinutes))?", "Start a \(TimedLock.durationLabel(reviewedMinutes)) lock?"), isPresented: $confirmation) {
             Button(L("Cancelar", "Cancel"), role: .cancel) {}
-            Button(L("Iniciar descanso de 3 horas", "Start 3-hour rest"), role: .destructive) {
-                do { try g.startRest(); dismiss() }
+            Button(L("Iniciar bloqueo", "Start lock"), role: .destructive) {
+                do { try g.startTimedLock(minutes: reviewedMinutes); dismiss() }
                 catch { saveFailed = true }
             }
         } message: {
-            Text(L("Guarda tu trabajo primero. El descanso empieza al confirmar y continúa si se reinicia Postura.",
-                   "Save your work first. The rest starts when you confirm and continues if Postura restarts."))
+            Text(L("Guarda tu trabajo primero. El bloqueo empieza al confirmar y continúa si se reinicia Postura.",
+                   "Save your work first. The lock starts when you confirm and continues if Postura restarts."))
         }
-        .alert(L("¿Activar el descanso diario de 1:00 a 4:00?", "Enable daily rest from 1:00 to 4:00 a.m.?"), isPresented: $confirmDailyRest) {
+        .alert(L("¿Guardar el horario diario?", "Save the daily schedule?"), isPresented: $confirmSchedule) {
             Button(L("Cancelar", "Cancel"), role: .cancel) {}
-            Button(L("Activar descanso diario", "Enable daily rest")) { dailyRestEnabled = true }
+            Button(L("Guardar horario", "Save schedule")) { schedule.save(); savedSchedule = schedule }
         } message: {
-            Text(L("Postura cubrirá todas las pantallas en ese horario cada día. Guarda tu trabajo antes de la 1:00.",
-                   "Postura will cover every display during these hours every day. Save your work before 1:00 a.m."))
+            Text(L("Postura cubrirá todas las pantallas cada día de \(scheduleLabel).",
+                   "Postura will cover every display each day during \(scheduleLabel)."))
         }
-        .alert(L("No se pudo iniciar el descanso", "Could not start Forced Rest"), isPresented: $saveFailed) {
+        .alert(L("No se pudo iniciar el bloqueo", "Could not start Timed Lock"), isPresented: $saveFailed) {
             Button(L("Aceptar", "OK"), role: .cancel) {}
         } message: {
             Text(L("Postura no pudo guardar el temporizador. La pantalla sigue disponible.",
@@ -1514,7 +1611,7 @@ struct PosturaSettingsView: View {
                     shell.relaunch()
                 }
                 Section(L("Avanzado", "Advanced")) {
-                    Button(L("Descanso forzado…", "Forced Rest…")) { advancedPresented = true }
+                    Button(L("Bloqueo temporal…", "Timed Lock…")) { advancedPresented = true }
                 }
             }
             .formStyle(.grouped)
@@ -1523,7 +1620,7 @@ struct PosturaSettingsView: View {
                 .padding([.trailing, .bottom], 18)
         }
         .frame(width: 438, height: model.glassesRequired ? 426 : 310)
-        .sheet(isPresented: $advancedPresented) { ForcedRestSettingsView() }
+        .sheet(isPresented: $advancedPresented) { TimedLockSettingsView() }
     }
 }
 

@@ -46,17 +46,17 @@ Your examples are kept by default. To delete them and the local logs as well, us
 shell installer's `uninstall --purge`. The shell installer also removes an older shell copy in
 `/Applications` when its login service identifies it and Homebrew does not manage it.
 
-## Forced Rest
+## Timed Lock
 
-Open **Settings → Advanced → Forced Rest** to cover every display for 3 hours. Save your
-work, review the duration, and confirm to begin. The cover shows the remaining time
-and clears automatically when it reaches zero, even with nobody in front of the camera. There is no
-in-app cancellation, and the countdown is restored if Postura restarts. Forced Rest uses macOS
-presentation mode in your signed-in session.
+Open **Settings → Advanced → Timed Lock** to cover every display. Choose 5, 15, or 30 minutes,
+1, 2, 3, 6, or 30 hours, or enter a custom duration from 1 minute to 30 hours. Save your work and
+confirm to begin. The countdown continues if Postura restarts. The cover clears automatically
+at zero, and there is no in-app cancellation.
 
-Enable **Daily, 1:00–4:00 a.m.** in the same panel for a recurring rest in your Mac's local time.
-When daily rest is enabled, a manual rest that overlaps 1:00 a.m. continues through at least 4:00 a.m.
-The optional strict-mode keeper can restore the app after the installed copy is removed.
+Use **Daily schedule** to set start and end times in your Mac’s local time. Overnight windows
+are supported. Your existing daily schedule is carried forward. A manual lock that overlaps a
+scheduled window lasts until the later end time. The optional strict-mode keeper can restore
+the app after the installed copy is removed.
 
 ## Replay a recording
 
@@ -146,6 +146,8 @@ who want detection that learns their own posture and an enforcement that cannot 
 - Glow technique: [AppleIntelligenceGlowEffect](https://github.com/jacobamobin/AppleIntelligenceGlowEffect) by Jacob Mobin and
   [IntelligenceGlow](https://github.com/Livsy90/IntelligenceGlow) by Livsy90 (MIT), rebuilt here in Core Animation with an organic, moving shape.
 - Pose and face models: [Google MediaPipe](https://github.com/google-ai-edge/mediapipe) (Apache-2.0), bundled in the release.
+
+The [website photograph by Vitaly Gariev](https://unsplash.com/photos/a-man-sitting-at-a-desk-using-a-laptop-computer-k-BbpcdZVMg) is used under the [Unsplash License](https://unsplash.com/license).
 
 ## Contributing
 
