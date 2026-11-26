@@ -1,7 +1,7 @@
 // Postura: camera posture guard for macOS. Clearly bad posture makes a glowing front close in
 // over every display; when it has covered the screen, mouse, keyboard, Cmd-Tab and Force Quit are blocked until the posture
 // is fixed. The judgement (p = 0..1 bad, why) comes from postura-eye.py; this app owns the camera, the timing and the screens.
-// Out of frame, far away, turned away, screen locked or on a call: never blocks. Everything runs on the Mac; no images are saved.
+// Posture coaching clears an empty frame. An explicitly confirmed Forced Rest uses its own countdown.
 import AppKit
 import Metal
 import QuartzCore
@@ -618,6 +618,96 @@ final class Liquid {
     }
 }
 
+struct ForcedRest: Codable {
+    static let durations = [3, 5, 8]
+    private static let maximumSeconds = 8.0 * 3600
+    static let file = supportDir.appendingPathComponent("forced-rest.json")
+    static let bootID: String? = {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 1 else { return nil }
+        var bytes = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &bytes, &size, nil, 0) == 0 else { return nil }
+        return String(cString: bytes)
+    }()
+
+    let deadline: Date
+    let elapsedDeadline: Double
+    let boot: String?
+
+    init(seconds: Double, now: Date = Date(), elapsed: Double = ForcedRest.elapsedTime(),
+         boot: String? = ForcedRest.bootID) {
+        deadline = now.addingTimeInterval(seconds)
+        elapsedDeadline = elapsed + seconds
+        self.boot = boot
+    }
+
+    func remaining(now: Date = Date(), elapsed: Double = ForcedRest.elapsedTime(),
+                   bootID: String? = ForcedRest.bootID) -> Double {
+        let seconds = boot != nil && boot == bootID ? elapsedDeadline - elapsed : deadline.timeIntervalSince(now)
+        return min(Self.maximumSeconds, max(0, seconds))
+    }
+
+    func save() throws { try JSONEncoder().encode(self).write(to: Self.file, options: .atomic) }
+
+    static func load() -> ForcedRest? {
+        guard let data = try? Data(contentsOf: file),
+              let stored = try? JSONDecoder().decode(Self.self, from: data) else { return nil }
+        let seconds = stored.remaining()
+        guard seconds > 0 else { try? fm.removeItem(at: file); return nil }
+        if stored.boot == bootID { return stored }
+        let restored = Self(seconds: seconds)
+        try? restored.save()
+        return restored
+    }
+
+    static func elapsedTime() -> Double { Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000 }
+
+    static func countdown(_ seconds: Double) -> String {
+        let whole = Int(ceil(seconds))
+        return String(format: "%d:%02d:%02d", whole / 3600, (whole / 60) % 60, whole % 60)
+    }
+}
+
+final class RestCover {
+    let window: KeyWin
+    let countdown = NSTextField(labelWithString: "")
+
+    init(screen: NSScreen) {
+        window = KeyWin(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        window.isOpaque = true
+        window.backgroundColor = NSColor(srgbRed: 0.065, green: 0.06, blue: 0.11, alpha: 1)
+        window.hasShadow = false
+
+        let title = NSTextField(labelWithString: L("Descanso forzado", "Forced Rest"))
+        title.font = .systemFont(ofSize: 38, weight: .semibold)
+        title.textColor = .white
+        countdown.font = .monospacedDigitSystemFont(ofSize: 20, weight: .medium)
+        countdown.textColor = NSColor.white.withAlphaComponent(0.78)
+        countdown.setAccessibilityLabel(L("Tiempo restante", "Time remaining"))
+        let detail = NSTextField(labelWithString: L("La pantalla se desbloqueará cuando termine la cuenta.",
+                                                   "The screen will reopen when the countdown ends."))
+        detail.font = .systemFont(ofSize: 14)
+        detail.textColor = NSColor.white.withAlphaComponent(0.68)
+
+        let stack = NSStackView(views: [title, countdown, detail])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let root = window.contentView!
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+                                     stack.centerYAnchor.constraint(equalTo: root.centerYAnchor)])
+    }
+
+    func update(seconds: Double) {
+        let value = ForcedRest.countdown(seconds)
+        if countdown.stringValue != value { countdown.stringValue = value }
+    }
+}
+
 final class CameraReceiver: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     var onFrame: ((CVPixelBuffer) -> Void)?
     func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -639,12 +729,17 @@ final class Guard: NSObject, NSApplicationDelegate {
     private var ownerPreviewVisible = false
     private var feedbackRequestedUntil = Date.distantPast
     private let cameraStateLock = NSLock()
-    private var cameraInterval = 0.4, requestPortrait = false
+    private var cameraInterval = 0.4, requestPortrait = false, suspendAnalysis = false
+    private(set) var rest: ForcedRest?
+    private var cameraRequested = false
+    private var restCovers: [RestCover] = []
+    private var restFrames: [NSRect] = []
 
     private func updateCameraSampling() {
         cameraStateLock.lock()
         cameraInterval = level == 0 && pBar < RELEASE ? 0.4 : 0.16
         requestPortrait = level >= 0.95
+        suspendAnalysis = rest != nil
         cameraStateLock.unlock()
     }
     var screenFrames: [NSRect] = [], liquids: [Liquid] = [], hud: NSWindow?, hudText: NSTextField?, keyMonitor: Any?
@@ -659,6 +754,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
             // locking hides the Dock and the menu bar, which posts this too: only a real change of displays rebuilds the cover
+            if let rest = self.rest { self.showRest(seconds: rest.remaining()); return }
             if !self.liquids.isEmpty, self.screenFrames != NSScreen.screens.map(\.frame) { self.dropLiquids() }
         }
         NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { _ in log("camera runtime error"); self.restartCamera() }
@@ -678,8 +774,11 @@ final class Guard: NSObject, NSApplicationDelegate {
                 else { self.revealScreen("camera analysis failed") }
             }
         }
+        rest = ForcedRest.load()
+        updateCameraSampling()
         shell.start()
-        requestCamera()
+        if let rest { showRest(seconds: rest.remaining()) }
+        else { requestCamera() }
         if !underAgent && !strictMode { shell.show() }
         every(1.0 / 30) { self.animate() }
         every(0.5) { self.tick() }
@@ -687,6 +786,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         startWatchdog()
         checkCall(); showHUD(); installHotkeys()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in   // while blocked this app has the keyboard: plain G corrects it
+            if self.rest != nil { return nil }
             guard self.blocked else { return e }
             if e.charactersIgnoringModifiers?.lowercased() == "g" { self.fixClicked() }
             return nil
@@ -717,6 +817,7 @@ final class Guard: NSObject, NSApplicationDelegate {
 
     // MARK: camera
     func requestCamera() {
+        cameraRequested = true
         let asking = AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined
         if asking {
             NSApp.setActivationPolicy(.regular)
@@ -724,8 +825,11 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
         AVCaptureDevice.requestAccess(for: .video) { allowed in
             DispatchQueue.main.async {
-                if allowed { self.startCamera() }
-                else { self.camera = false; log("camera permission denied") }
+                if allowed {
+                    if self.rest == nil { self.startCamera() }
+                } else {
+                    self.camera = false; log("camera permission denied")
+                }
             }
         }
     }
@@ -771,7 +875,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
     }
     func restartCamera() {
-        guard camera, Date().timeIntervalSince(lastCameraRestart) >= 5 else { return }
+        guard rest == nil, camera, Date().timeIntervalSince(lastCameraRestart) >= 5 else { return }
         lastCameraRestart = Date()
         queue.async {
             if self.session.inputs.isEmpty { DispatchQueue.main.async { self.startCamera() }; return }
@@ -782,9 +886,9 @@ final class Guard: NSObject, NSApplicationDelegate {
     func cameraFrame(_ pb: CVPixelBuffer) {
         let now = Date()  // 2.5 frames/s while all is well, 6/s while something looks wrong
         cameraStateLock.lock()
-        let interval = cameraInterval, portrait = requestPortrait
+        let interval = cameraInterval, portrait = requestPortrait, suspended = suspendAnalysis
         cameraStateLock.unlock()
-        guard now.timeIntervalSince(lastProcessed) > interval else { return }
+        guard !suspended, now.timeIntervalSince(lastProcessed) > interval else { return }
         if lastProcessed == .distantPast { log("camera delivering frames") }
         lastProcessed = now
         eye.send(pb, preview: portrait)
@@ -793,6 +897,7 @@ final class Guard: NSObject, NSApplicationDelegate {
     // MARK: judgement -> smoothed p
     func reset(_ why: String) { if (level > 0 || blocked) && pBar > 0 { log("clear: \(why)") }; pBar = 0 }
     func revealScreen(_ why: String) {
+        guard rest == nil else { return }
         reset(why)
         coverTiming = CoverTiming()
         present = false; releasing = false; level = 0
@@ -803,6 +908,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         updateCameraSampling()
     }
     func handle(_ s: [String: Any], _ now: Date) {
+        guard rest == nil else { return }
         let dt = min(1.0, max(0.05, now.timeIntervalSince(lastSampleAt)))
         lastFrame = now; lastSampleAt = now; lastSample = s
         if let saved = s["trainingSaved"] as? Int {
@@ -845,6 +951,10 @@ final class Guard: NSObject, NSApplicationDelegate {
     func animate() {
         let now = Date(), dt = min(0.1, max(0, now.timeIntervalSince(lastAnim))); lastAnim = now
         beatLock.lock(); beat = ProcessInfo.processInfo.systemUptime; beatLock.unlock()
+        if let rest {
+            if rest.remaining(now: now) > 0 { return }
+            endRest()
+        }
         let motion = coverTiming.motion(at: now, covering: level > 0)
         let good = motion == .drain || locked
         let cap = inCall ? 0.22 : 1.0
@@ -879,8 +989,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         liquids.forEach { $0.win.ignoresMouseEvents = !on }
         if on {
             log("BAD \(reason) p=\(f2(pBar)) \(brief(lastSample))")
-            NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
-            NSApp.presentationOptions = [.hideDock, .hideMenuBar, .disableProcessSwitching, .disableForceQuit, .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
+            lockPresentation()
             (liquids.first { $0.main } ?? liquids.first)?.win.makeKey()
         } else {
             log("ok p=\(f2(pBar)) \(brief(lastSample))")
@@ -888,12 +997,66 @@ final class Guard: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func lockPresentation() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.presentationOptions = [.hideDock, .hideMenuBar, .disableProcessSwitching, .disableForceQuit,
+                                     .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
+    }
+
+    func startRest(hours: Int) throws {
+        guard ForcedRest.durations.contains(hours), rest == nil else { return }
+        let session = ForcedRest(seconds: Double(hours * 3600))
+        try session.save()
+        log("forced rest started for \(hours) h")
+        revealScreen("forced rest started")
+        rest = session
+        updateCameraSampling()
+        queue.async { if self.session.isRunning { self.session.stopRunning() } }
+        hud?.orderOut(nil)
+        showRest(seconds: session.remaining())
+        tick()
+    }
+
+    private func showRest(seconds: Double) {
+        let screens = NSScreen.screens
+        let frames = screens.map(\.frame)
+        if restFrames != frames {
+            let previous = restCovers
+            restFrames = frames
+            restCovers = screens.map { RestCover(screen: $0) }
+            for cover in restCovers {
+                cover.update(seconds: seconds)
+                cover.window.orderFrontRegardless()
+            }
+            if !locked, let window = restCovers.first?.window {
+                lockPresentation()
+                window.makeKeyAndOrderFront(nil)
+            }
+            previous.forEach { $0.window.orderOut(nil) }
+        }
+        restCovers.forEach { $0.update(seconds: seconds) }
+    }
+
+    private func endRest() {
+        rest = nil
+        try? fm.removeItem(at: ForcedRest.file)
+        NSApp.presentationOptions = []
+        restCovers.forEach { $0.window.orderOut(nil) }
+        restCovers = []
+        restFrames = []
+        revealScreen("forced rest ended")
+        if cameraRequested { restartCamera() }
+        else { requestCamera() }
+        log("forced rest ended")
+    }
+
     // MARK: teaching and corrections
     // Feedback collects six seconds of live posture or eyewear measurements.
     var glassesWarning: Bool { reasonKind == "glasses" || reasonKind == "sunglasses" }
     @objc func fixClicked() { teach(glassesWarning ? "gafas" : "good") }
     func teach(_ label: String) {
-        guard Date() >= feedbackRequestedUntil, (lastSample["training"] as? String ?? "").isEmpty else { return }
+        guard rest == nil, Date() >= feedbackRequestedUntil, (lastSample["training"] as? String ?? "").isEmpty else { return }
         let eyewear = label == "gafas" || label == "singafas"
         guard lastSample["face"] as? Bool == true,
               (eyewear || lastSample["body"] as? Bool == true),
@@ -946,6 +1109,22 @@ final class Guard: NSObject, NSApplicationDelegate {
     func tick() {
         let now = Date()
         locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
+        if let rest {
+            let seconds = rest.remaining(now: now)
+            showRest(seconds: seconds)
+            if !locked, let window = restCovers.first?.window, !window.isKeyWindow || !NSApp.isActive {
+                lockPresentation()
+                window.makeKeyAndOrderFront(nil)
+            }
+            hud?.orderOut(nil)
+            writeStatus(now, mode: "forced-rest", extra: [
+                "endsAt": Int(now.timeIntervalSince1970 + seconds),
+                "secondsRemaining": Int(ceil(seconds)),
+                "coverCount": restCovers.count,
+                "level": restCovers.isEmpty ? 0 : 1
+            ])
+            return
+        }
         let stale = now.timeIntervalSince(lastFrame)
         if stale > 1.25, present || level > 0 { revealScreen("no frames") }
         if stale > 12, now.timeIntervalSince(lastCameraRestart) > 12, camera, !locked { restartCamera() }                       // lid was closed, camera taken away, etc.
@@ -996,13 +1175,17 @@ final class Guard: NSObject, NSApplicationDelegate {
         shell.update(level: level, blocked: blocked, p: pBar, present: present, camera: camera, inCall: inCall,
                      reason: reason.prefix(1).uppercased() + reason.dropFirst(), kind: reasonKind,
                      feedback: now < noteUntil ? note : "", sample: stale <= 1.25 ? lastSample : [:])
-        let mode = blocked ? "blocked" : level > 0 ? "filling" : "off"
+        writeStatus(now, mode: blocked ? "blocked" : level > 0 ? "filling" : "off")
+    }
+
+    private func writeStatus(_ now: Date, mode: String, extra: [String: Any] = [:]) {
         if mode == wroteMode, now.timeIntervalSince(wroteAt) < 2 { return }                  // every 2 s or on a change: less disk writing
         wroteMode = mode; wroteAt = now
         var st: [String: Any] = ["mode": mode, "level": level, "reason": reason, "p": pBar, "present": present,
                                  "inCall": inCall, "locked": locked, "blockedSeconds": Int(blockedSeconds), "at": Int(now.timeIntervalSince1970), "sample": lastSample]
         st["ownerPreview"] = ownerPreviewVisible
         st["camera"] = cameraName
+        st.merge(extra) { _, new in new }
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL, options: .atomic) }
     }
     func checkCall() {
@@ -1189,8 +1372,54 @@ struct PosturaView: View {
     }
 }
 
+struct ForcedRestSettingsView: View {
+    @State private var hours = 3
+    @State private var confirmation = false
+    @State private var saveFailed = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(L("Descanso forzado", "Forced Rest")).font(.title2.bold())
+            Text(L("Cubre todas las pantallas y bloquea el uso normal del Mac durante el tiempo elegido, incluso si no hay nadie ante la cámara.",
+                   "Cover every display and block normal Mac use for the selected time, even when nobody is in front of the camera."))
+            Picker(L("Duración", "Duration"), selection: $hours) {
+                ForEach(ForcedRest.durations, id: \.self) { Text("\($0) h").tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Text(L("Cuando empiece, Postura no ofrecerá una opción para terminar antes.",
+                   "Once the rest starts, Postura provides no way to end it early."))
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Button(L("Volver", "Back")) { dismiss() }
+                Spacer()
+                Button(L("Revisar descanso de \(hours) h…", "Review \(hours)-hour rest…")) { confirmation = true }
+            }
+        }
+        .padding(24)
+        .frame(width: 390)
+        .alert(L("¿Iniciar descanso forzado de \(hours) horas?", "Start a \(hours)-hour Forced Rest?"), isPresented: $confirmation) {
+            Button(L("Cancelar", "Cancel"), role: .cancel) {}
+            Button(L("Iniciar descanso de \(hours) horas", "Start \(hours)-hour rest"), role: .destructive) {
+                do { try g.startRest(hours: hours); dismiss() }
+                catch { saveFailed = true }
+            }
+        } message: {
+            Text(L("Guarda tu trabajo primero. El descanso empieza al confirmar y continúa si se reinicia Postura.",
+                   "Save your work first. The rest starts when you confirm and continues if Postura restarts."))
+        }
+        .alert(L("No se pudo iniciar el descanso", "Could not start Forced Rest"), isPresented: $saveFailed) {
+            Button(L("Aceptar", "OK"), role: .cancel) {}
+        } message: {
+            Text(L("Postura no pudo guardar el temporizador. La pantalla sigue disponible.",
+                   "Postura could not save the timer. Your screen is still available."))
+        }
+    }
+}
+
 struct PosturaSettingsView: View {
     @ObservedObject var model: Model
+    @State private var advancedPresented = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -1233,13 +1462,17 @@ struct PosturaSettingsView: View {
                     else { prefs.set(value, forKey: "language") }
                     shell.relaunch()
                 }
+                Section(L("Avanzado", "Advanced")) {
+                    Button(L("Descanso forzado…", "Forced Rest…")) { advancedPresented = true }
+                }
             }
             .formStyle(.grouped)
             Button(L("Listo", "Done")) { dismiss() }
                 .keyboardShortcut(.defaultAction)
                 .padding([.trailing, .bottom], 18)
         }
-        .frame(width: 438, height: model.glassesRequired ? 370 : 255)
+        .frame(width: 438, height: model.glassesRequired ? 426 : 310)
+        .sheet(isPresented: $advancedPresented) { ForcedRestSettingsView() }
     }
 }
 
@@ -1312,6 +1545,7 @@ final class Shell: NSObject, NSMenuDelegate, NSWindowDelegate {
         model.settingsPresented = true
     }
     @objc func show() {
+        guard g.rest == nil else { return }
         if window == nil {
             let w = NSWindow(contentViewController: NSHostingController(rootView: PosturaView(model: model) { g.teach($0) }))
             w.title = "Postura"; w.styleMask = [.titled, .closable, .miniaturizable]; w.isReleasedWhenClosed = false; w.delegate = self

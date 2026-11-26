@@ -46,6 +46,14 @@ Your examples are kept by default. To delete them and the local logs as well, us
 shell installer's `uninstall --purge`. The shell installer also removes an older shell copy in
 `/Applications` when its login service identifies it and Homebrew does not manage it.
 
+## Forced Rest
+
+Open **Settings → Advanced → Forced Rest** to cover every display for 3, 5, or 8 hours. The default is
+3 hours. Save your work, review the duration, and confirm to begin. The cover shows the remaining time
+and clears automatically when it reaches zero, even with nobody in front of the camera. There is no
+in-app cancellation, and the countdown is restored if Postura restarts. Forced Rest uses macOS
+presentation mode in your signed-in session.
+
 ## Replay a recording
 
 For offline posture analysis, run `python3 "$RESOURCES/postura-eye.py" --video clip.mov` using the app's Python
