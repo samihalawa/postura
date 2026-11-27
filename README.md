@@ -52,7 +52,10 @@ Open **Settings → Challenges**. Posture, Glasses, and Healthy Lockout can run 
 A 7-, 14-, or 30-day commitment keeps the chosen challenge enabled until it ends.
 
 - **Posture and Glasses** each have three resets per local calendar day. Each reset grants a two-minute pause for that challenge.
-- **Healthy Lockout** offers manual timers and an editable daily schedule, including overnight windows. It sends macOS reminders 60, 15, and 5 minutes before a scheduled lock when notifications are allowed. The start can move at most two hours from the original schedule, and time edits are spaced at least three days apart. A weekly reset gives two hours of access before the remaining lock resumes.
+- **One-time lock** starts on confirmation or after a delay you set. You choose the duration and review the exact hours before confirming. For example, start in 20 minutes and cover the displays for 4 hours.
+- **Daily schedule and challenge** sets local start and end times, including overnight windows. Opening Postura after the daily start skips that occurrence unless the lock had already started. A 7-, 14-, or 30-day challenge commits to those daily hours. The start can move at most two hours from the original schedule, with at least three days between edits.
+- **When the times overlap**, keep both on their original hours, replace the first overlapping daily occurrence with the one-time lock, or start at the earlier time and add both full durations. Later daily occurrences keep their hours.
+- **Reminders and resets** apply to Healthy Lockout. Allow macOS notifications to receive reminders 60, 15, and 5 minutes before a planned start. A weekly reset gives two hours of access before the remaining lock resumes.
 
 ## Replay a recording
 

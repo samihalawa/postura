@@ -623,7 +623,7 @@ struct TimedLock: Codable {
     static let defaultMinutes = 180
     static let maximumMinutes = 30 * 60
     static let presets = [5, 15, 30, 60, 120, 180, 360, 1800]
-    private static let maximumSeconds = Double(maximumMinutes * 60) + 7200
+    private static let maximumSeconds = Double((maximumMinutes + 26 * 60) * 60) + 7200
 
     static func durationLabel(_ minutes: Int) -> String {
         let hours = minutes / 60, remainder = minutes % 60
@@ -704,16 +704,21 @@ struct TimedLockSchedule: Codable, Equatable {
         return Self(enabled: prefs.bool(forKey: "dailyForcedRest"), start: 60, end: 240)
     }
 
-    func remaining(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> Double? {
+    func nextWindow(after date: Date, calendar: Calendar = .autoupdatingCurrent) -> DateInterval? {
         guard enabled, isValid else { return nil }
         let today = calendar.startOfDay(for: date)
-        let previous = calendar.date(byAdding: .day, value: -1, to: today)
-        for day in [today, previous].compactMap({ $0 }) {
-            if let window = window(on: day, calendar: calendar), date >= window.start, date < window.end {
-                return window.end.timeIntervalSince(date)
-            }
-        }
-        return nil
+        return (0...2).lazy.compactMap { offset in
+            calendar.date(byAdding: .day, value: offset, to: today).flatMap { window(on: $0, calendar: calendar) }
+        }.first { $0.start > date }
+    }
+
+    static func startsNow(_ window: DateInterval, at now: Date) -> Bool {
+        // Allow for the half-second timer and brief main-thread delays, without catching up after sleep.
+        now >= window.start && now.timeIntervalSince(window.start) <= 5 && now < window.end
+    }
+
+    var hoursLabel: String {
+        "\(Self.pickerDate(start).formatted(date: .omitted, time: .shortened))–\(Self.pickerDate(end).formatted(date: .omitted, time: .shortened))"
     }
 
     func window(on day: Date, calendar: Calendar) -> DateInterval? {
@@ -739,6 +744,68 @@ struct TimedLockSchedule: Codable, Equatable {
     static func minutes(of date: Date) -> Int {
         let components = Calendar.autoupdatingCurrent.dateComponents([.hour, .minute], from: date)
         return (components.hour ?? 0) * 60 + (components.minute ?? 0)
+    }
+}
+
+enum LockoutOverlap: String, Codable, CaseIterable, Identifiable {
+    case keep, replace, combine
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .keep: L("Mantener ambos", "Keep both")
+        case .replace: L("Sustituir esta vez", "Replace this occurrence")
+        case .combine: L("Sumar las duraciones", "Add the durations")
+        }
+    }
+    var explanation: String {
+        switch self {
+        case .keep: L("Cada bloqueo conserva sus horas. El tiempo en común cuenta una sola vez.",
+                      "Each lock keeps its own hours. Overlapping time counts once.")
+        case .replace: L("Solo se aplica el bloqueo puntual en lugar de esta sesión diaria.",
+                         "The one-time lock takes the place of this daily occurrence.")
+        case .combine: L("Empieza a la primera de las dos horas y dura la suma de ambos bloqueos.",
+                         "Starts at the earlier time and lasts for both full durations.")
+        }
+    }
+}
+
+struct OneTimeLockout: Codable, Equatable {
+    let interval: DateInterval
+    let dailyOccurrence: DateInterval?
+    let overlap: LockoutOverlap
+
+    init(requested: DateInterval, conflict: DateInterval?, overlap: LockoutOverlap) {
+        self.overlap = conflict == nil ? .keep : overlap
+        dailyOccurrence = conflict
+        if overlap == .combine, let conflict {
+            interval = DateInterval(start: min(requested.start, conflict.start),
+                                    duration: requested.duration + conflict.duration)
+        } else {
+            interval = requested
+        }
+    }
+
+    static func conflict(for requested: DateInterval, schedule: TimedLockSchedule, after now: Date,
+                         calendar: Calendar = .autoupdatingCurrent) -> DateInterval? {
+        let earliest = max(now, requested.start.addingTimeInterval(-26 * 3600))
+        guard var candidate = schedule.nextWindow(after: earliest, calendar: calendar) else { return nil }
+        while candidate.end <= requested.start {
+            guard let next = schedule.nextWindow(after: candidate.start, calendar: calendar) else { return nil }
+            candidate = next
+        }
+        return candidate.start < requested.end ? candidate : nil
+    }
+
+    func replaces(_ daily: DateInterval) -> Bool { overlap != .keep && dailyOccurrence == daily }
+    var retainUntil: Date {
+        overlap == .keep ? interval.end : max(interval.end, dailyOccurrence?.end ?? interval.end)
+    }
+
+    static func enforcementEnd(plan: Self?, daily: DateInterval?, at now: Date) -> Date? {
+        let oneTimeEnd = plan.flatMap { $0.interval.start <= now && now < $0.interval.end ? $0.interval.end : nil }
+        guard let daily, TimedLockSchedule.startsNow(daily, at: now),
+              plan?.replaces(daily) != true else { return oneTimeEnd }
+        return max(oneTimeEnd ?? daily.end, daily.end)
     }
 }
 
@@ -771,6 +838,7 @@ struct ChallengeState: Codable {
     var schedule: TimedLockSchedule?
     var scheduleAnchor: Int?
     var scheduleEditedAt: Date?
+    var oneTimeLockout: OneTimeLockout?
 
     func isCommitted(_ challenge: Challenge, at now: Date) -> Bool { commitments[challenge].map { $0 > now } ?? false }
     func recentResets(_ challenge: Challenge, at now: Date, calendar: Calendar = .autoupdatingCurrent) -> [Date] {
@@ -786,6 +854,14 @@ struct ChallengeState: Codable {
         guard proposed.isValid else { return L("Elige horas diferentes.", "Choose different start and end times.") }
         if !proposed.enabled, isCommitted(.lockout, at: now) {
             return L("El reto sigue activo.", "This challenge is still committed.")
+        }
+        if proposed != previous, let plan = oneTimeLockout, now < plan.retainUntil {
+            let proposedConflict = OneTimeLockout.conflict(for: plan.interval, schedule: proposed, after: now)
+            let currentConflict = OneTimeLockout.conflict(for: plan.interval, schedule: previous, after: now)
+            if proposedConflict != currentConflict {
+                return L("Espera a que termine el bloqueo puntual o cancélalo antes de cambiar estas horas.",
+                         "Wait for the one-time lock to finish or cancel it before changing these hours.")
+            }
         }
         guard proposed.start != previous.start || proposed.end != previous.end else { return nil }
         if let edit = scheduleEditedAt, now < edit.addingTimeInterval(3 * 86400) {
@@ -830,15 +906,18 @@ final class ChallengeRules: ObservableObject {
         try save(next)
         if challenge == .glasses { prefs.set(enabled, forKey: "requireGlasses"); g.eye.restart() }
     }
-    func commit(_ challenge: Challenge, days: Int, at now: Date = Date()) throws {
+    func commit(_ challenge: Challenge, days: Int, schedule proposed: TimedLockSchedule? = nil, at now: Date = Date()) throws {
         guard [7, 14, 30].contains(days), !state.isCommitted(challenge, at: now) else { return }
         var next = state
         next.commitments[challenge] = now.addingTimeInterval(Double(days) * 86400)
         if challenge == .lockout {
-            var schedule = TimedLockSchedule.load()
+            let current = TimedLockSchedule.load()
+            var schedule = proposed ?? current
             schedule.enabled = true
+            guard state.scheduleError(schedule, previous: current, at: now) == nil else { return }
             next.schedule = schedule
-            next.scheduleAnchor = next.scheduleAnchor ?? schedule.start
+            next.scheduleAnchor = next.scheduleAnchor ?? current.start
+            if schedule.start != current.start || schedule.end != current.end { next.scheduleEditedAt = now }
         } else {
             next.enabled[challenge] = true
         }
@@ -852,6 +931,11 @@ final class ChallengeRules: ObservableObject {
         next.schedule = proposed
         next.scheduleAnchor = next.scheduleAnchor ?? current.start
         if proposed.start != current.start || proposed.end != current.end { next.scheduleEditedAt = now }
+        try save(next)
+    }
+    func saveOneTimeLockout(_ plan: OneTimeLockout?) throws {
+        var next = state
+        next.oneTimeLockout = plan
         try save(next)
     }
     func useReset(_ challenge: Challenge, at now: Date) throws -> Bool {
@@ -877,12 +961,18 @@ final class LockoutReminders: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    static func upcoming(_ schedule: TimedLockSchedule, now: Date, calendar: Calendar) -> [(Date, Int)] {
+    static func upcoming(_ schedule: TimedLockSchedule, plan: OneTimeLockout? = nil,
+                         now: Date, calendar: Calendar) -> [(Date, Int)] {
         let today = calendar.startOfDay(for: now)
-        return (0..<8).flatMap { day -> [(Date, Int)] in
+        let dailyStarts = (0..<8).compactMap { day -> Date? in
             guard let date = calendar.date(byAdding: .day, value: day, to: today),
-                  let start = schedule.window(on: date, calendar: calendar)?.start else { return [] }
-            return offsets.compactMap { minutes in
+                  let window = schedule.window(on: date, calendar: calendar),
+                  plan?.replaces(window) != true else { return nil }
+            return window.start
+        }
+        let starts = Set(dailyStarts + [plan?.interval.start].compactMap { $0 })
+        return starts.sorted().flatMap { start in
+            offsets.compactMap { minutes in
                 let time = start.addingTimeInterval(-Double(minutes * 60))
                 return time > now ? (time, minutes) : nil
             }
@@ -892,7 +982,8 @@ final class LockoutReminders: NSObject, UNUserNotificationCenterDelegate {
     func refresh(now: Date = Date()) {
         let calendar = Calendar.current
         let schedule = TimedLockSchedule.load()
-        let key = "\(schedule.enabled)/\(schedule.start)/\(schedule.end)/\(calendar.startOfDay(for: now))/\(calendar.timeZone.identifier)"
+        let plan = ChallengeRules.shared.state.oneTimeLockout
+        let key = "\(schedule.enabled)/\(schedule.start)/\(schedule.end)/\(calendar.startOfDay(for: now))/\(calendar.timeZone.identifier)/\(String(describing: plan))"
         guard lastKey != key, !pending else { return }
         pending = true
         lastKey = key
@@ -900,7 +991,7 @@ final class LockoutReminders: NSObject, UNUserNotificationCenterDelegate {
             DispatchQueue.main.async {
                 self.pending = false
                 self.center.removePendingNotificationRequests(withIdentifiers: requests.map(\.identifier).filter { $0.hasPrefix("healthy-lockout-") })
-                for (fire, minutes) in Self.upcoming(schedule, now: now, calendar: calendar) {
+                for (fire, minutes) in Self.upcoming(schedule, plan: plan, now: now, calendar: calendar) {
                     let content = UNMutableNotificationContent()
                     content.title = L("Bloqueo saludable", "Healthy Lockout")
                     content.body = L("Empieza en \(minutes) minutos. Guarda tu trabajo.", "Starts in \(minutes) minutes. Save your work.")
@@ -908,7 +999,7 @@ final class LockoutReminders: NSObject, UNUserNotificationCenterDelegate {
                     var components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: fire)
                     components.timeZone = calendar.timeZone
                     let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
-                    self.center.add(UNNotificationRequest(identifier: "healthy-lockout-\(Int(fire.timeIntervalSince1970))", content: content, trigger: trigger))
+                    self.center.add(UNNotificationRequest(identifier: "healthy-lockout-\(Int(fire.timeIntervalSince1970))-\(minutes)", content: content, trigger: trigger))
                 }
             }
         }
@@ -1003,6 +1094,8 @@ final class Guard: NSObject, NSApplicationDelegate {
     private var cameraInterval = 0.4, requestPortrait = false, suspendAnalysis = false
     private(set) var rest: TimedLock?
     private var pausedLock: TimedLock?
+    private var dailyScheduleKey: String?
+    private var nextDailyWindow: DateInterval?
     lazy var reminders = LockoutReminders()
     private var cameraRequested = false
     private var restCovers: [TimedLockCover] = []
@@ -1294,16 +1387,33 @@ final class Guard: NSObject, NSApplicationDelegate {
                                      .disableSessionTermination, .disableHideApplication, .disableAppleMenu]
     }
 
-    func startTimedLock(minutes: Int) throws {
-        guard rest == nil, pausedLock == nil, (1...TimedLock.maximumMinutes).contains(minutes) else { return }
-        try applyRest(TimedLock(seconds: Double(minutes * 60)))
-        log("timed lock started for \(TimedLock.durationLabel(minutes))")
+    func queueLockout(_ plan: OneTimeLockout) throws {
+        let rules = ChallengeRules.shared
+        guard rules.state.oneTimeLockout == nil else { throw CocoaError(.fileWriteFileExists) }
+        try rules.saveOneTimeLockout(plan)
+        reminders.requestPermission()
         tick()
     }
 
     private func checkTimedLockSchedule(at now: Date) {
+        let rules = ChallengeRules.shared
+        let schedule = TimedLockSchedule.load()
+        let calendar = Calendar.autoupdatingCurrent
+        let key = "\(schedule.enabled)/\(schedule.start)/\(schedule.end)/\(calendar.timeZone.identifier)"
+        if key != dailyScheduleKey {
+            dailyScheduleKey = key
+            nextDailyWindow = schedule.nextWindow(after: now, calendar: calendar)
+        }
+        let plan = rules.state.oneTimeLockout
+        if let plan, now >= plan.retainUntil { try? rules.saveOneTimeLockout(nil) }
+
         if let paused = pausedLock {
-            guard now >= paused.resumeAt ?? now else { return }
+            if now < paused.resumeAt ?? now {
+                if let daily = nextDailyWindow, now >= daily.start {
+                    nextDailyWindow = schedule.nextWindow(after: now, calendar: calendar)
+                }
+                return
+            }
             let remaining = paused.remaining(now: now)
             if remaining > 0 {
                 do { try applyRest(TimedLock(seconds: remaining, now: now)); pausedLock = nil }
@@ -1313,11 +1423,18 @@ final class Guard: NSObject, NSApplicationDelegate {
                 try? fm.removeItem(at: TimedLock.file)
             }
         }
-        guard let seconds = TimedLockSchedule.load().remaining(at: now) else { return }
-        if let rest, rest.remaining(now: now) + 1 >= seconds { return }
+        let due = nextDailyWindow.flatMap { now >= $0.start ? $0 : nil }
+        guard let end = OneTimeLockout.enforcementEnd(plan: plan, daily: due, at: now) else {
+            if due != nil { nextDailyWindow = schedule.nextWindow(after: now, calendar: calendar) }
+            return
+        }
+        let seconds = end.timeIntervalSince(now)
         do {
-            try applyRest(TimedLock(seconds: seconds, now: now))
-            log("scheduled timed lock active")
+            if (rest?.remaining(now: now) ?? 0) + 0.25 < seconds || rest == nil {
+                try applyRest(TimedLock(seconds: seconds, now: now))
+                log("planned timed lock active")
+            }
+            if due != nil { nextDailyWindow = schedule.nextWindow(after: now, calendar: calendar) }
         } catch {
             // Retry on the next status tick without leaving the session in a partially applied state.
             if wroteMode != "daily-rest-error" { log("could not save scheduled timed lock: \(error)") }
@@ -1559,6 +1676,12 @@ final class Guard: NSObject, NSApplicationDelegate {
         let schedule = TimedLockSchedule.load()
         st["dailyForcedRest"] = schedule.enabled
         st["dailyTimedLock"] = ["enabled": schedule.enabled, "startMinute": schedule.start, "endMinute": schedule.end]
+        if let nextDailyWindow { st["nextDailyLockout"] = Int(nextDailyWindow.start.timeIntervalSince1970) }
+        if let plan = ChallengeRules.shared.state.oneTimeLockout {
+            st["oneTimeLockout"] = ["startsAt": Int(plan.interval.start.timeIntervalSince1970),
+                                   "endsAt": Int(plan.interval.end.timeIntervalSince1970),
+                                   "overlap": plan.overlap.rawValue]
+        }
         st.merge(extra) { _, new in new }
         if let d = try? JSONSerialization.data(withJSONObject: st) { try? d.write(to: statusURL, options: .atomic) }
     }
@@ -1747,26 +1870,42 @@ struct PosturaView: View {
 
 struct TimedLockSettingsView: View {
     private static let custom = 0
+    @State private var tab = 0
     @State private var selection = TimedLock.defaultMinutes
     @State private var customMinutes: Int? = TimedLock.defaultMinutes
-    @State private var reviewedMinutes = TimedLock.defaultMinutes
+    @State private var delay: Int? = 0
+    @State private var overlap = LockoutOverlap.keep
+    @State private var reviewed: OneTimeLockout?
     @State private var schedule = TimedLockSchedule.load()
     @State private var savedSchedule = TimedLockSchedule.load()
+    @State private var days = 7
     @State private var confirmation = false
     @State private var saveFailed = false
     @State private var confirmSchedule = false
+    @State private var confirmChallenge = false
     @ObservedObject private var rules = ChallengeRules.shared
     @Environment(\.dismiss) private var dismiss
 
     private var minutes: Int { selection == Self.custom ? customMinutes ?? 0 : selection }
     private var validDuration: Bool { (1...TimedLock.maximumMinutes).contains(minutes) }
+    private var validDelay: Bool { (0...1440).contains(delay ?? -1) }
+    private var committed: Bool { rules.state.isCommitted(.lockout, at: Date()) }
     private var scheduleIssue: String? { rules.state.scheduleError(schedule, previous: savedSchedule, at: Date()) }
+    private var candidate: OneTimeLockout? {
+        guard validDuration, validDelay, let delay else { return nil }
+        let now = Date()
+        let requested = DateInterval(start: now.addingTimeInterval(Double(delay * 60)), duration: Double(minutes * 60))
+        let conflict = OneTimeLockout.conflict(for: requested, schedule: savedSchedule, after: now)
+        return OneTimeLockout(requested: requested, conflict: conflict, overlap: overlap)
+    }
 
-    private func saveSchedule() {
+    private func saveSchedule(commit: Bool = false) {
         do {
-            try rules.saveSchedule(schedule)
+            if commit { try rules.commit(.lockout, days: days, schedule: schedule) }
+            else { try rules.saveSchedule(schedule) }
             savedSchedule = TimedLockSchedule.load()
-            if savedSchedule.enabled { g.reminders.requestPermission() }
+            schedule = savedSchedule
+            if schedule.enabled { g.reminders.requestPermission() }
         } catch { saveFailed = true }
     }
 
@@ -1775,86 +1914,174 @@ struct TimedLockSettingsView: View {
                 set: { schedule[keyPath: path] = TimedLockSchedule.minutes(of: $0) })
     }
 
-    private var scheduleLabel: String {
-        "\(TimedLockSchedule.pickerDate(schedule.start).formatted(date: .omitted, time: .shortened))–\(TimedLockSchedule.pickerDate(schedule.end).formatted(date: .omitted, time: .shortened))"
+    private func dateLabel(_ date: Date) -> String { date.formatted(date: .abbreviated, time: .shortened) }
+
+    private func period(_ interval: DateInterval) -> String {
+        "\(dateLabel(interval.start)) → \(dateLabel(interval.end))"
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(Challenge.lockout.title).font(.title2.bold())
-            Text(L("Cubre todas las pantallas hasta que termine la cuenta, sin opción para salir antes desde Postura.",
-                   "Cover every display until the countdown ends. One weekly reset gives you two hours before the lock resumes."))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+    private func planSummary(_ plan: OneTimeLockout) -> String {
+        guard let daily = plan.dailyOccurrence else { return period(plan.interval) }
+        if plan.overlap == .keep {
+            let joined = DateInterval(start: min(daily.start, plan.interval.start), end: max(daily.end, plan.interval.end))
+            return period(joined)
+        }
+        return period(plan.interval)
+    }
 
-            HStack {
-                Picker(L("Duración", "Duration"), selection: $selection) {
-                    ForEach(TimedLock.presets, id: \.self) { Text(TimedLock.durationLabel($0)).tag($0) }
-                    Text(L("Personalizada…", "Custom…")).tag(Self.custom)
+    private var oneTime: some View {
+        Form {
+            if let plan = rules.state.oneTimeLockout {
+                Section(L("Bloqueo puntual programado", "Scheduled one-time lock")) {
+                    LabeledContent(L("Horas", "Lock hours"), value: period(plan.interval))
+                    if plan.dailyOccurrence != nil { LabeledContent(L("Horario diario", "Daily occurrence"), value: plan.overlap.title) }
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        if context.date < plan.interval.start {
+                            let countdown = TimedLock.countdown(plan.interval.start.timeIntervalSince(context.date))
+                            LabeledContent(L("Empieza en", "Starts in"), value: countdown).monospacedDigit()
+                            Button(L("Cancelar bloqueo puntual", "Cancel one-time lock"), role: .destructive) {
+                                guard Date() < plan.interval.start else { return }
+                                do { try rules.saveOneTimeLockout(nil) } catch { saveFailed = true }
+                            }
+                        } else {
+                            Text(L("Este bloqueo puntual ya ha empezado.", "This one-time lock has already started."))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
-                .fixedSize()
-                Spacer()
-                Button(L("Revisar bloqueo…", "Review lock…")) {
-                    reviewedMinutes = minutes
-                    confirmation = true
-                }
-                .disabled(!validDuration)
-            }
-            if selection == Self.custom {
-                TextField(L("Minutos (1–1800)", "Minutes (1–1800)"), value: $customMinutes, format: .number)
-                    .textFieldStyle(.roundedBorder)
-                if !validDuration {
-                    Text(L("Introduce de 1 a 1800 minutos.", "Enter a duration from 1 to 1,800 minutes."))
+            } else {
+                Section(L("Temporizador", "Timer")) {
+                    TextField(L("Empieza en (minutos)", "Start in (minutes)"), value: $delay, format: .number)
+                    Text(validDelay
+                         ? L("0 empieza al confirmar. Hasta 1440 minutos.", "0 starts on confirmation. Set up to 1,440 minutes.")
+                         : L("Introduce de 0 a 1440 minutos.", "Enter 0 to 1,440 minutes."))
                         .font(.caption).foregroundStyle(.secondary)
+                    Picker(L("Duración", "Duration"), selection: $selection) {
+                        ForEach(TimedLock.presets, id: \.self) { Text(TimedLock.durationLabel($0)).tag($0) }
+                        Text(L("Personalizada…", "Custom…")).tag(Self.custom)
+                    }
+                    if selection == Self.custom {
+                        TextField(L("Duración en minutos (1–1800)", "Duration in minutes (1–1,800)"), value: $customMinutes, format: .number)
+                    }
+                }
+                if let plan = candidate {
+                    if let daily = plan.dailyOccurrence {
+                        Section(L("Coincide con el horario diario", "Overlaps the daily schedule")) {
+                            Text(period(daily)).foregroundStyle(.secondary)
+                            Picker(L("En esta ocasión", "For this occurrence"), selection: $overlap) {
+                                ForEach(LockoutOverlap.allCases) { option in Text(option.title).tag(option) }
+                            }.pickerStyle(.radioGroup)
+                            Text(plan.overlap.explanation).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Section {
+                        LabeledContent(L("Pantallas cubiertas", "Displays covered"), value: planSummary(plan))
+                        Button(L("Revisar bloqueo puntual…", "Review one-time lock…")) {
+                            reviewed = candidate
+                            confirmation = reviewed != nil
+                        }.glassControl()
+                    } footer: {
+                        Text(L("El horario diario y el reto siguen vigentes los demás días.",
+                               "Your daily schedule and challenge continue on other days."))
+                    }
                 }
             }
+        }.formStyle(.grouped)
+    }
 
-            Divider()
-            Toggle(L("Horario diario", "Daily schedule"), isOn: $schedule.enabled)
-                .disabled(rules.state.isCommitted(.lockout, at: Date()))
-            HStack(spacing: 20) {
-                DatePicker(L("Desde", "From"), selection: time(\.start), displayedComponents: .hourAndMinute)
-                DatePicker(L("Hasta", "Until"), selection: time(\.end), displayedComponents: .hourAndMinute)
-            }
-            .disabled(!schedule.enabled)
-            Text(scheduleIssue ?? L("Avisos 60, 15 y 5 min antes. El modo diario usa la hora local.",
-                                     "Reminders 60, 15 and 5 min before. The daily schedule uses local time."))
-                .font(.caption).foregroundStyle(.secondary)
-
-            HStack {
-                Button(L("Volver", "Back")) { dismiss() }
-                Spacer()
+    private var daily: some View {
+        Form {
+            Section(L("Horas de cada día", "Daily hours")) {
+                Toggle(L("Horario diario", "Daily schedule"), isOn: $schedule.enabled).disabled(committed)
+                DatePicker(L("Empieza a las", "Starts at"), selection: time(\.start), displayedComponents: .hourAndMinute)
+                DatePicker(L("Termina a las", "Ends at"), selection: time(\.end), displayedComponents: .hourAndMinute)
+                if schedule.start > schedule.end {
+                    Text(L("Termina al día siguiente.", "Ends the following day.")).font(.caption).foregroundStyle(.secondary)
+                }
+                Text(scheduleIssue ?? L("Si abres Postura después del inicio, el siguiente bloqueo empieza mañana. Avisos 60, 15 y 5 min antes si permites las notificaciones.",
+                                        "If you open Postura after today’s start, the next lock starts tomorrow. Allow notifications for reminders 60, 15 and 5 minutes before."))
+                    .font(.caption).foregroundStyle(.secondary)
+                if let next = savedSchedule.nextWindow(after: Date()) {
+                    let plan = rules.state.oneTimeLockout
+                    let nextOccurrence = plan?.replaces(next) == true ? savedSchedule.nextWindow(after: next.start) : next
+                    if let nextOccurrence {
+                        LabeledContent(L("Próximo inicio diario", "Next daily start"), value: dateLabel(nextOccurrence.start))
+                    }
+                }
                 Button(L("Guardar horario", "Save schedule")) {
                     if schedule.enabled { confirmSchedule = true }
                     else { saveSchedule() }
+                }.disabled(schedule == savedSchedule || scheduleIssue != nil)
+            }
+            Section(L("Reto diario", "Daily challenge")) {
+                Text(L("Mantén las horas elegidas cada día durante el reto. Los bloqueos puntuales siguen disponibles.",
+                       "Commit to the selected daily hours for a set number of days. You can still schedule one-time locks."))
+                    .font(.caption).foregroundStyle(.secondary)
+                if committed, let end = rules.state.commitments[.lockout] {
+                    LabeledContent(L("El reto termina", "Challenge ends"), value: dateLabel(end))
+                    LabeledContent(L("Horas guardadas", "Committed daily hours"), value: savedSchedule.hoursLabel)
+                } else {
+                    Picker(L("Duración del reto", "Challenge length"), selection: $days) {
+                        ForEach([7, 14, 30], id: \.self) { duration in
+                            Text(L("\(duration) días", "\(duration) days")).tag(duration)
+                        }
+                    }.pickerStyle(.segmented)
+                    Button(L("Revisar reto diario…", "Review daily challenge…")) { confirmChallenge = true }
+                        .glassControl().disabled(scheduleIssue != nil)
                 }
-                .disabled(schedule == savedSchedule || scheduleIssue != nil)
             }
+        }.formStyle(.grouped)
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Text(Challenge.lockout.title).font(.title2.bold())
+            Picker(L("Tipo de bloqueo", "Lockout type"), selection: $tab) {
+                Text(L("Bloqueo puntual", "One-time lock")).tag(0)
+                Text(L("Horario y reto", "Schedule & challenge")).tag(1)
+            }.pickerStyle(.segmented).labelsHidden().padding(.horizontal, 20)
+            if tab == 0 { oneTime } else { daily }
+            HStack {
+                Text(L("Un reinicio semanal da acceso durante 2 h.", "One weekly reset gives you two hours of access."))
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(L("Listo", "Done")) { dismiss() }
+            }.padding([.horizontal, .bottom], 20)
         }
-        .padding(24)
-        .frame(width: 430)
-        .alert(L("¿Iniciar bloqueo de \(TimedLock.durationLabel(reviewedMinutes))?", "Start a \(TimedLock.durationLabel(reviewedMinutes)) lock?"), isPresented: $confirmation) {
+        .padding(.top, 20)
+        .frame(width: 540, height: 570)
+        .alert(L("¿Confirmar bloqueo puntual?", "Confirm one-time lock?"), isPresented: $confirmation, presenting: reviewed) { plan in
             Button(L("Cancelar", "Cancel"), role: .cancel) {}
-            Button(L("Iniciar bloqueo", "Start lock"), role: .destructive) {
-                do { try g.startTimedLock(minutes: reviewedMinutes); dismiss() }
-                catch { saveFailed = true }
+            Button(delay == 0 && plan.overlap != .combine ? L("Bloquear ahora", "Lock now") : L("Programar bloqueo", "Schedule lock"), role: .destructive) {
+                do {
+                    let finalPlan = delay == 0 && plan.overlap != .combine
+                        ? OneTimeLockout(requested: DateInterval(start: Date(), duration: plan.interval.duration),
+                                         conflict: plan.dailyOccurrence, overlap: plan.overlap)
+                        : plan
+                    guard delay == 0 || finalPlan.interval.start > Date() else { throw CocoaError(.userCancelled) }
+                    try g.queueLockout(finalPlan)
+                    if finalPlan.interval.start <= Date() { dismiss() }
+                } catch { saveFailed = true }
             }
-        } message: {
-            Text(L("Guarda tu trabajo primero. El bloqueo empieza al confirmar y continúa si se reinicia Postura.",
-                   "Save your work first. The lock starts when you confirm and continues if Postura restarts."))
+        } message: { plan in
+            Text(planSummary(plan) + "\n" + L("Guarda tu trabajo antes del inicio.", "Save your work before the start."))
         }
         .alert(L("¿Guardar el horario diario?", "Save the daily schedule?"), isPresented: $confirmSchedule) {
             Button(L("Cancelar", "Cancel"), role: .cancel) {}
             Button(L("Guardar horario", "Save schedule")) { saveSchedule() }
         } message: {
-            Text(L("Postura cubrirá todas las pantallas cada día de \(scheduleLabel).",
-                   "Postura will cover every display each day during \(scheduleLabel)."))
+            Text(L("Bloqueo diario de \(schedule.hoursLabel). Si ya pasó el inicio de hoy, comienza mañana.",
+                   "Daily lockout from \(schedule.hoursLabel). If today’s start has passed, the first lock is tomorrow."))
         }
-        .alert(L("No se pudo iniciar el bloqueo", "Could not save Healthy Lockout"), isPresented: $saveFailed) {
-            Button(L("Aceptar", "OK"), role: .cancel) {}
+        .alert(L("¿Empezar reto de \(days) días?", "Start a \(days)-day daily challenge?"), isPresented: $confirmChallenge) {
+            Button(L("Cancelar", "Cancel"), role: .cancel) {}
+            Button(L("Empezar reto", "Start challenge")) { saveSchedule(commit: true) }
         } message: {
-            Text(L("Postura no pudo guardar el temporizador. La pantalla sigue disponible.",
-                   "Postura could not save the timer. Your screen is still available."))
+            Text(L("Bloqueo de \(schedule.hoursLabel) cada día durante \(days) días. El horario sigue activo hasta que lo desactives después del reto.",
+                   "Lock daily from \(schedule.hoursLabel) for \(days) days. The schedule stays on until you turn it off after the challenge."))
+        }
+        .alert(L("No se pudo guardar el bloqueo", "Couldn’t save the lockout"), isPresented: $saveFailed) {
+            Button(L("Aceptar", "OK"), role: .cancel) {}
         }
     }
 }
@@ -1878,7 +2105,7 @@ struct ChallengeSettingsRow: View {
                     Label(challenge.title, systemImage: challenge.symbol).fontWeight(.medium)
                     Spacer()
                     if challenge == .lockout {
-                        Button(L("Configurar…", "Configure…"), action: openSchedule).glassControl()
+                        Button(L("Temporizador y horario…", "Timer & schedule…"), action: openSchedule).glassControl()
                     } else {
                         Toggle(challenge.title, isOn: Binding(get: { rules.enabled(challenge) }, set: { value in
                             do { try rules.setEnabled(challenge, value) } catch { saveFailed = true }
@@ -1900,7 +2127,7 @@ struct ChallengeSettingsRow: View {
                 if committed, let end = rules.state.commitments[challenge] {
                     Label(end.formatted(date: .abbreviated, time: .shortened), systemImage: "lock.fill")
                         .font(.caption).foregroundStyle(.secondary).accessibilityLabel(L("Fin del reto", "Commitment ends") + " " + end.formatted())
-                } else {
+                } else if challenge != .lockout {
                     Menu(L("Empezar reto", "Start challenge")) {
                         ForEach([7, 14, 30], id: \.self) { duration in
                             Button(L("\(duration) días", "\(duration) days")) { days = duration; confirm = true }
@@ -1915,7 +2142,6 @@ struct ChallengeSettingsRow: View {
             Button(L("Empezar", "Start")) {
                 do {
                     try rules.commit(challenge, days: days)
-                    if challenge == .lockout { g.reminders.requestPermission() }
                 } catch { saveFailed = true }
             }
         } message: {
