@@ -46,17 +46,13 @@ Your examples are kept by default. To delete them and the local logs as well, us
 shell installer's `uninstall --purge`. The shell installer also removes an older shell copy in
 `/Applications` when its login service identifies it and Homebrew does not manage it.
 
-## Timed Lock
+## Challenges
 
-Open **Settings → Advanced → Timed Lock** to cover every display. Choose 5, 15, or 30 minutes,
-1, 2, 3, 6, or 30 hours, or enter a custom duration from 1 minute to 30 hours. Save your work and
-confirm to begin. The countdown continues if Postura restarts. The cover clears automatically
-at zero, and there is no in-app cancellation.
+Open **Settings → Challenges**. Posture, Glasses, and Healthy Lockout can run together.
+A 7-, 14-, or 30-day commitment keeps the chosen challenge enabled until it ends.
 
-Use **Daily schedule** to set start and end times in your Mac’s local time. Overnight windows
-are supported. Your existing daily schedule is carried forward. A manual lock that overlaps a
-scheduled window lasts until the later end time. The optional strict-mode keeper can restore
-the app after the installed copy is removed.
+- **Posture and Glasses** each have three resets per local calendar day. Each reset grants a two-minute pause for that challenge.
+- **Healthy Lockout** offers manual timers and an editable daily schedule, including overnight windows. It sends macOS reminders 60, 15, and 5 minutes before a scheduled lock when notifications are allowed. The start can move at most two hours from the original schedule, and time edits are spaced at least three days apart. A weekly reset gives two hours of access before the remaining lock resumes.
 
 ## Replay a recording
 
@@ -74,7 +70,7 @@ score, and reason. To test live detection with a recording, choose **OBS Virtual
 | Sit up | After 2 seconds of corrected posture, the glow opens back out over about 2.5 seconds. |
 | Leave the frame while it is warning | The cover clears when nobody is detected. |
 | Are on a video call (FaceTime, Teams, WebRTC in the browser) | Only a faint edge glow, it never blocks. |
-| Disagree with it | Press **Ctrl-Opt-Cmd-G** or click **My posture is good**. Postura learns from the live camera and reveals the screen once it detects corrected posture. |
+| Disagree with it | Press **Ctrl-Opt-Cmd-G** to label your posture, or use an available reset to pause the challenge for two minutes. |
 
 <img src=".github/assets/cover.svg" alt="Illustration of the posture cover and feedback button" width="100%">
 

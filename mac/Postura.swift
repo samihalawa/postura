@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 import Accelerate
 import Carbon.HIToolbox
 import CoreImage
+import UserNotifications
 
 let fm = FileManager.default
 let supportDir = ProcessInfo.processInfo.environment["POSTURA_HOME"].map { URL(fileURLWithPath: $0) }
@@ -622,7 +623,7 @@ struct TimedLock: Codable {
     static let defaultMinutes = 180
     static let maximumMinutes = 30 * 60
     static let presets = [5, 15, 30, 60, 120, 180, 360, 1800]
-    private static let maximumSeconds = Double(maximumMinutes * 60)
+    private static let maximumSeconds = Double(maximumMinutes * 60) + 7200
 
     static func durationLabel(_ minutes: Int) -> String {
         let hours = minutes / 60, remainder = minutes % 60
@@ -642,12 +643,14 @@ struct TimedLock: Codable {
     let deadline: Date
     let elapsedDeadline: Double
     let boot: String?
+    let resumeAt: Date?
 
     init(seconds: Double, now: Date = Date(), elapsed: Double = TimedLock.elapsedTime(),
-         boot: String? = TimedLock.bootID) {
+         boot: String? = TimedLock.bootID, resumeAt: Date? = nil) {
         deadline = now.addingTimeInterval(seconds)
         elapsedDeadline = elapsed + seconds
         self.boot = boot
+        self.resumeAt = resumeAt
     }
 
     func remaining(now: Date = Date(), elapsed: Double = TimedLock.elapsedTime(),
@@ -664,7 +667,7 @@ struct TimedLock: Codable {
         let seconds = stored.remaining()
         guard seconds > 0 else { try? fm.removeItem(at: file); return nil }
         if stored.boot == bootID { return stored }
-        let restored = Self(seconds: seconds)
+        let restored = Self(seconds: seconds, resumeAt: stored.resumeAt)
         try? restored.save()
         return restored
     }
@@ -677,7 +680,7 @@ struct TimedLock: Codable {
     }
 }
 
-struct TimedLockSchedule: Equatable {
+struct TimedLockSchedule: Codable, Equatable {
     private static let key = "timedLockSchedule"
     private static let minutesPerDay = 24 * 60
     var enabled: Bool
@@ -688,7 +691,9 @@ struct TimedLockSchedule: Equatable {
         (0..<Self.minutesPerDay).contains(start) && (0..<Self.minutesPerDay).contains(end) && start != end
     }
 
-    static func load() -> Self {
+    static func load() -> Self { ChallengeRules.shared.state.schedule ?? legacy() }
+
+    static func legacy() -> Self {
         if let values = prefs.dictionary(forKey: key),
            let enabled = values["enabled"] as? Bool,
            let start = values["start"] as? Int,
@@ -699,27 +704,29 @@ struct TimedLockSchedule: Equatable {
         return Self(enabled: prefs.bool(forKey: "dailyForcedRest"), start: 60, end: 240)
     }
 
-    func save() {
-        guard isValid else { return }
-        prefs.set(["enabled": enabled, "start": start, "end": end], forKey: Self.key)
-    }
-
     func remaining(at date: Date, calendar: Calendar = .autoupdatingCurrent) -> Double? {
         guard enabled, isValid else { return nil }
         let today = calendar.startOfDay(for: date)
         let previous = calendar.date(byAdding: .day, value: -1, to: today)
         for day in [today, previous].compactMap({ $0 }) {
-            let endDay = start > end ? calendar.date(byAdding: .day, value: 1, to: day) : day
-            guard let endDay,
-                  let begins = calendar.date(bySettingHour: start / 60, minute: start % 60, second: 0, of: day,
-                                             matchingPolicy: .nextTime, repeatedTimePolicy: .first),
-                  let ends = calendar.date(bySettingHour: end / 60, minute: end % 60, second: 0, of: endDay,
-                                           matchingPolicy: .nextTime, repeatedTimePolicy: .last),
-                  calendar.isDate(begins, inSameDayAs: day), calendar.isDate(ends, inSameDayAs: endDay),
-                  date >= begins, date < ends else { continue }
-            return ends.timeIntervalSince(date)
+            if let window = window(on: day, calendar: calendar), date >= window.start, date < window.end {
+                return window.end.timeIntervalSince(date)
+            }
         }
         return nil
+    }
+
+    func window(on day: Date, calendar: Calendar) -> DateInterval? {
+        guard enabled, isValid else { return nil }
+        let endDay = start > end ? calendar.date(byAdding: .day, value: 1, to: day) : day
+        guard let endDay,
+              let begins = calendar.date(bySettingHour: start / 60, minute: start % 60, second: 0, of: day,
+                                         matchingPolicy: .nextTime, repeatedTimePolicy: .first),
+              let ends = calendar.date(bySettingHour: end / 60, minute: end % 60, second: 0, of: endDay,
+                                       matchingPolicy: .nextTime, repeatedTimePolicy: .last),
+              calendar.isDate(begins, inSameDayAs: day), calendar.isDate(ends, inSameDayAs: endDay),
+              begins < ends else { return nil }
+        return DateInterval(start: begins, end: ends)
     }
 
     static func pickerDate(_ minutes: Int) -> Date {
@@ -735,11 +742,191 @@ struct TimedLockSchedule: Equatable {
     }
 }
 
+enum Challenge: String, Codable, CaseIterable, Identifiable {
+    case posture, glasses, lockout
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .posture: L("Postura", "Posture")
+        case .glasses: L("Gafas", "Glasses")
+        case .lockout: L("Bloqueo saludable", "Healthy Lockout")
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .posture: "figure.stand"
+        case .glasses: "eyeglasses"
+        case .lockout: "lock"
+        }
+    }
+    var limit: Int { self == .lockout ? 1 : 3 }
+    var resetSeconds: TimeInterval { self == .lockout ? 7200 : 120 }
+    var resetLabel: String { self == .lockout ? L("Acceso por 2 h", "Unlock for 2 hours") : L("Pausar 2 min", "Pause for 2 minutes") }
+}
+
+struct ChallengeState: Codable {
+    var enabled: [Challenge: Bool] = [:]
+    var commitments: [Challenge: Date] = [:]
+    var resets: [Challenge: [Date]] = [:]
+    var schedule: TimedLockSchedule?
+    var scheduleAnchor: Int?
+    var scheduleEditedAt: Date?
+
+    func isCommitted(_ challenge: Challenge, at now: Date) -> Bool { commitments[challenge].map { $0 > now } ?? false }
+    func recentResets(_ challenge: Challenge, at now: Date, calendar: Calendar = .autoupdatingCurrent) -> [Date] {
+        let start = challenge == .lockout ? now.addingTimeInterval(-7 * 86400) : calendar.startOfDay(for: now)
+        return (resets[challenge] ?? []).filter { $0 > start || ($0 == start && challenge != .lockout) }
+    }
+    func allowance(_ challenge: Challenge, at now: Date) -> Int { max(0, challenge.limit - recentResets(challenge, at: now).count) }
+    func paused(_ challenge: Challenge, at now: Date) -> Bool {
+        resets[challenge]?.last.map { $0.addingTimeInterval(challenge.resetSeconds) > now } ?? false
+    }
+
+    func scheduleError(_ proposed: TimedLockSchedule, previous: TimedLockSchedule, at now: Date) -> String? {
+        guard proposed.isValid else { return L("Elige horas diferentes.", "Choose different start and end times.") }
+        if !proposed.enabled, isCommitted(.lockout, at: now) {
+            return L("El reto sigue activo.", "This challenge is still committed.")
+        }
+        guard proposed.start != previous.start || proposed.end != previous.end else { return nil }
+        if let edit = scheduleEditedAt, now < edit.addingTimeInterval(3 * 86400) {
+            let next = edit.addingTimeInterval(3 * 86400).formatted(date: .abbreviated, time: .shortened)
+            return L("Próximo cambio: \(next).", "Next schedule edit: \(next).")
+        }
+        let anchor = scheduleAnchor ?? previous.start
+        let shift = abs(proposed.start - anchor)
+        if min(shift, 1440 - shift) > 120 { return L("El inicio puede moverse 2 horas como máximo.", "Start time can move at most 2 hours.") }
+        let oldDuration = (previous.end - previous.start + 1440) % 1440
+        let newDuration = (proposed.end - proposed.start + 1440) % 1440
+        if isCommitted(.lockout, at: now), newDuration < oldDuration {
+            return L("No puedes acortar el horario durante el reto.", "The schedule can’t be shortened during a commitment.")
+        }
+        return nil
+    }
+}
+
+final class ChallengeRules: ObservableObject {
+    static let shared = ChallengeRules()
+    private let file = supportDir.appendingPathComponent("challenges.json")
+    @Published private(set) var state: ChallengeState
+
+    private init() {
+        state = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(ChallengeState.self, from: $0) } ?? ChallengeState()
+    }
+    func save(_ updated: ChallengeState) throws {
+        try JSONEncoder().encode(updated).write(to: file, options: .atomic)
+        state = updated
+    }
+    func enabled(_ challenge: Challenge) -> Bool {
+        switch challenge {
+        case .posture: state.enabled[.posture] ?? true
+        case .glasses: state.enabled[.glasses] ?? prefs.bool(forKey: "requireGlasses")
+        case .lockout: TimedLockSchedule.load().enabled
+        }
+    }
+    func setEnabled(_ challenge: Challenge, _ enabled: Bool) throws {
+        guard challenge != .lockout, enabled || !state.isCommitted(challenge, at: Date()) else { return }
+        var next = state
+        next.enabled[challenge] = enabled
+        try save(next)
+        if challenge == .glasses { prefs.set(enabled, forKey: "requireGlasses"); g.eye.restart() }
+    }
+    func commit(_ challenge: Challenge, days: Int, at now: Date = Date()) throws {
+        guard [7, 14, 30].contains(days), !state.isCommitted(challenge, at: now) else { return }
+        var next = state
+        next.commitments[challenge] = now.addingTimeInterval(Double(days) * 86400)
+        if challenge == .lockout {
+            var schedule = TimedLockSchedule.load()
+            schedule.enabled = true
+            next.schedule = schedule
+            next.scheduleAnchor = next.scheduleAnchor ?? schedule.start
+        } else {
+            next.enabled[challenge] = true
+        }
+        try save(next)
+        if challenge == .glasses { prefs.set(true, forKey: "requireGlasses"); g.eye.restart() }
+    }
+    func saveSchedule(_ proposed: TimedLockSchedule, at now: Date = Date()) throws {
+        let current = TimedLockSchedule.load()
+        guard state.scheduleError(proposed, previous: current, at: now) == nil else { return }
+        var next = state
+        next.schedule = proposed
+        next.scheduleAnchor = next.scheduleAnchor ?? current.start
+        if proposed.start != current.start || proposed.end != current.end { next.scheduleEditedAt = now }
+        try save(next)
+    }
+    func useReset(_ challenge: Challenge, at now: Date) throws -> Bool {
+        guard state.allowance(challenge, at: now) > 0, !state.paused(challenge, at: now) else { return false }
+        var next = state
+        next.resets[challenge] = next.recentResets(challenge, at: now) + [now]
+        try save(next)
+        return true
+    }
+}
+
+final class LockoutReminders: NSObject, UNUserNotificationCenterDelegate {
+    static let offsets = [60, 15, 5]
+    private let center = UNUserNotificationCenter.current()
+    private var lastKey: String?
+    private var pending = false
+
+    override init() { super.init(); center.delegate = self }
+
+    func requestPermission() {
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in
+            DispatchQueue.main.async { self.lastKey = nil; self.refresh() }
+        }
+    }
+
+    static func upcoming(_ schedule: TimedLockSchedule, now: Date, calendar: Calendar) -> [(Date, Int)] {
+        let today = calendar.startOfDay(for: now)
+        return (0..<8).flatMap { day -> [(Date, Int)] in
+            guard let date = calendar.date(byAdding: .day, value: day, to: today),
+                  let start = schedule.window(on: date, calendar: calendar)?.start else { return [] }
+            return offsets.compactMap { minutes in
+                let time = start.addingTimeInterval(-Double(minutes * 60))
+                return time > now ? (time, minutes) : nil
+            }
+        }
+    }
+
+    func refresh(now: Date = Date()) {
+        let calendar = Calendar.current
+        let schedule = TimedLockSchedule.load()
+        let key = "\(schedule.enabled)/\(schedule.start)/\(schedule.end)/\(calendar.startOfDay(for: now))/\(calendar.timeZone.identifier)"
+        guard lastKey != key, !pending else { return }
+        pending = true
+        lastKey = key
+        center.getPendingNotificationRequests { requests in
+            DispatchQueue.main.async {
+                self.pending = false
+                self.center.removePendingNotificationRequests(withIdentifiers: requests.map(\.identifier).filter { $0.hasPrefix("healthy-lockout-") })
+                for (fire, minutes) in Self.upcoming(schedule, now: now, calendar: calendar) {
+                    let content = UNMutableNotificationContent()
+                    content.title = L("Bloqueo saludable", "Healthy Lockout")
+                    content.body = L("Empieza en \(minutes) minutos. Guarda tu trabajo.", "Starts in \(minutes) minutes. Save your work.")
+                    content.sound = .default
+                    var components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: fire)
+                    components.timeZone = calendar.timeZone
+                    let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
+                    self.center.add(UNNotificationRequest(identifier: "healthy-lockout-\(Int(fire.timeIntervalSince1970))", content: content, trigger: trigger))
+                }
+            }
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completion: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completion([.banner, .list, .sound])
+    }
+}
+
 final class TimedLockCover {
     let window: KeyWin
     let countdown = NSTextField(labelWithString: "")
+    let reset = NSButton()
+    private let resetSurface: NSView
 
-    init(screen: NSScreen) {
+    init(screen: NSScreen, target: AnyObject, action: Selector) {
         window = KeyWin(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
         window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
@@ -747,7 +934,7 @@ final class TimedLockCover {
         window.backgroundColor = NSColor(srgbRed: 0.065, green: 0.06, blue: 0.11, alpha: 1)
         window.hasShadow = false
 
-        let title = NSTextField(labelWithString: L("Bloqueo temporal", "Timed Lock"))
+        let title = NSTextField(labelWithString: L("Bloqueo saludable", "Healthy Lockout"))
         title.font = .systemFont(ofSize: 38, weight: .semibold)
         title.textColor = .white
         countdown.font = .monospacedDigitSystemFont(ofSize: 20, weight: .medium)
@@ -758,7 +945,22 @@ final class TimedLockCover {
         detail.font = .systemFont(ofSize: 14)
         detail.textColor = NSColor.white.withAlphaComponent(0.68)
 
-        let stack = NSStackView(views: [title, countdown, detail])
+        reset.title = Challenge.lockout.resetLabel
+        reset.target = target
+        reset.action = action
+        reset.bezelStyle = .rounded
+        reset.controlSize = .large
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.cornerRadius = 15
+            if #available(macOS 27.0, *) { glass.effectIsInteractive = true }
+            reset.isBordered = false
+            glass.contentView = reset
+            resetSurface = glass
+        } else {
+            resetSurface = reset
+        }
+        let stack = NSStackView(views: [title, countdown, detail, resetSurface])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
@@ -768,6 +970,8 @@ final class TimedLockCover {
         NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo: root.centerXAnchor),
                                      stack.centerYAnchor.constraint(equalTo: root.centerYAnchor)])
     }
+
+    func setResetAvailable(_ available: Bool) { resetSurface.isHidden = !available }
 
     func update(seconds: Double) {
         let value = TimedLock.countdown(seconds)
@@ -798,6 +1002,8 @@ final class Guard: NSObject, NSApplicationDelegate {
     private let cameraStateLock = NSLock()
     private var cameraInterval = 0.4, requestPortrait = false, suspendAnalysis = false
     private(set) var rest: TimedLock?
+    private var pausedLock: TimedLock?
+    lazy var reminders = LockoutReminders()
     private var cameraRequested = false
     private var restCovers: [TimedLockCover] = []
     private var restFrames: [NSRect] = []
@@ -841,8 +1047,12 @@ final class Guard: NSObject, NSApplicationDelegate {
                 else { self.revealScreen("camera analysis failed") }
             }
         }
-        rest = TimedLock.load()
+        if let saved = TimedLock.load() {
+            if let resume = saved.resumeAt, resume > Date() { pausedLock = saved }
+            else { rest = saved }
+        }
         checkTimedLockSchedule(at: Date())
+        reminders.refresh()
         updateCameraSampling()
         shell.start()
         if let rest { showRest(seconds: rest.remaining()) }
@@ -992,18 +1202,30 @@ final class Guard: NSObject, NSApplicationDelegate {
             coverTiming = CoverTiming()
             return
         }
-        let judged = (s["face"] as? Bool) == true && (s["kind"] as? String) != "unjudged"
-        let score = judged ? (s["p"] as? NSNumber)?.doubleValue ?? 0 : 0
+        let rules = ChallengeRules.shared
+        let postureEnabled = rules.enabled(.posture) && !rules.state.paused(.posture, at: now)
+        let glassesEnabled = rules.enabled(.glasses) && !rules.state.paused(.glasses, at: now)
+        let postureScore = postureEnabled ? (s["postureScore"] as? NSNumber)?.doubleValue ?? 0 : 0
+        let glassesScore = glassesEnabled ? (s["glassesScore"] as? NSNumber)?.doubleValue ?? 0 : 0
+        let judged = (postureEnabled || glassesEnabled) && (s["face"] as? Bool) == true && (s["kind"] as? String) != "unjudged"
+        let score = judged ? max(postureScore, glassesScore) : 0
         pBar += (1 - exp(-dt / 1.2)) * (score - pBar)
 
         // Ambiguous posture can never start a cover. Once full, wait for a
         // clearly corrected posture or an empty frame before uncovering.
-        let shouldCover = score >= BLOCK || (blocked && (!judged || score > RELEASE))
+        let shouldCover = score >= BLOCK || (blocked && ((postureEnabled || glassesEnabled) && !judged || score > RELEASE))
         if !releasing { coverTiming.observe(hide: shouldCover, at: now, covering: level > 0) }
         if score >= BLOCK {
-            reason = s["why"] as? String ?? ""
-            reasonKind = s["kind"] as? String ?? ""
-        } else if blocked && !judged {
+            let posture = s["postureWhy"] as? String ?? ""
+            let glasses = s["glassesWhy"] as? String ?? ""
+            if postureScore >= BLOCK && glassesScore >= BLOCK {
+                reason = [posture, glasses].joined(separator: " · "); reasonKind = "both"
+            } else if glassesScore >= BLOCK {
+                reason = glasses; reasonKind = s["glassesKind"] as? String ?? "glasses"
+            } else {
+                reason = posture; reasonKind = ""
+            }
+        } else if blocked && !judged && (postureEnabled || glassesEnabled) {
             reason = L("postura fuera de vista", "posture out of view")
             reasonKind = "hidden"
         } else if judged && reasonKind == "hidden" {
@@ -1042,7 +1264,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         if level <= 0 { silhouette.clear(); ownerPreviewVisible = false; message = nil; if !liquids.isEmpty { dropLiquids() }; return }
         if liquids.isEmpty {
             screenFrames = NSScreen.screens.map(\.frame)
-            liquids = NSScreen.screens.map { Liquid(frame: $0.frame, main: $0 == NSScreen.main || NSScreen.screens.count == 1, target: self, action: #selector(fixClicked)) }
+            liquids = NSScreen.screens.map { Liquid(frame: $0.frame, main: $0 == NSScreen.main || NSScreen.screens.count == 1, target: self, action: #selector(fixClicked(_:))) }
             liquids.forEach { $0.win.ignoresMouseEvents = !blocked; $0.win.orderFrontRegardless() }
         }
         let t = now.timeIntervalSince(t0)
@@ -1073,13 +1295,24 @@ final class Guard: NSObject, NSApplicationDelegate {
     }
 
     func startTimedLock(minutes: Int) throws {
-        guard rest == nil, (1...TimedLock.maximumMinutes).contains(minutes) else { return }
+        guard rest == nil, pausedLock == nil, (1...TimedLock.maximumMinutes).contains(minutes) else { return }
         try applyRest(TimedLock(seconds: Double(minutes * 60)))
         log("timed lock started for \(TimedLock.durationLabel(minutes))")
         tick()
     }
 
     private func checkTimedLockSchedule(at now: Date) {
+        if let paused = pausedLock {
+            guard now >= paused.resumeAt ?? now else { return }
+            let remaining = paused.remaining(now: now)
+            if remaining > 0 {
+                do { try applyRest(TimedLock(seconds: remaining, now: now)); pausedLock = nil }
+                catch { return }
+            } else {
+                pausedLock = nil
+                try? fm.removeItem(at: TimedLock.file)
+            }
+        }
         guard let seconds = TimedLockSchedule.load().remaining(at: now) else { return }
         if let rest, rest.remaining(now: now) + 1 >= seconds { return }
         do {
@@ -1108,7 +1341,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         if restFrames != frames {
             let previous = restCovers
             restFrames = frames
-            restCovers = screens.map { TimedLockCover(screen: $0) }
+            restCovers = screens.map { TimedLockCover(screen: $0, target: self, action: #selector(resetLockout)) }
             for cover in restCovers {
                 cover.update(seconds: seconds)
                 cover.window.orderFrontRegardless()
@@ -1119,12 +1352,29 @@ final class Guard: NSObject, NSApplicationDelegate {
             }
             previous.forEach { $0.window.orderOut(nil) }
         }
-        restCovers.forEach { $0.update(seconds: seconds) }
+        let available = ChallengeRules.shared.state.allowance(.lockout, at: Date()) > 0
+        restCovers.forEach { $0.update(seconds: seconds); $0.setResetAvailable(available) }
     }
 
-    private func endRest() {
+    @objc private func resetLockout() {
+        guard let rest else { return }
+        let now = Date(), rules = ChallengeRules.shared
+        guard rules.state.allowance(.lockout, at: now) > 0 else { return }
+        let seconds = Challenge.lockout.resetSeconds
+        let paused = TimedLock(seconds: rest.remaining(now: now) + seconds, now: now, resumeAt: now.addingTimeInterval(seconds))
+        let previous = rules.state
+        do {
+            guard try rules.useReset(.lockout, at: now) else { return }
+            do { try paused.save() }
+            catch { try? rules.save(previous); throw error }
+            pausedLock = paused
+            endRest(keepTimer: true)
+        } catch { log("could not reset healthy lockout: \(error)") }
+    }
+
+    private func endRest(keepTimer: Bool = false) {
         rest = nil
-        try? fm.removeItem(at: TimedLock.file)
+        if !keepTimer { try? fm.removeItem(at: TimedLock.file) }
         NSApp.presentationOptions = []
         restCovers.forEach { $0.window.orderOut(nil) }
         restCovers = []
@@ -1138,7 +1388,42 @@ final class Guard: NSObject, NSApplicationDelegate {
     // MARK: teaching and corrections
     // Feedback collects six seconds of live posture or eyewear measurements.
     var glassesWarning: Bool { reasonKind == "glasses" || reasonKind == "sunglasses" }
-    @objc func fixClicked() { teach(glassesWarning ? "gafas" : "good") }
+    private var coverChallenges: [Challenge] {
+        reasonKind == "both" ? [.posture, .glasses] : [glassesWarning ? .glasses : .posture]
+    }
+    @objc func fixClicked(_ sender: NSButton? = nil) {
+        let options = coverChallenges.filter { ChallengeRules.shared.state.allowance($0, at: Date()) > 0 }
+        guard options.count > 1, let sender else {
+            if let first = options.first { resetCameraChallenge(first) }
+            return
+        }
+        let menu = NSMenu()
+        for option in options {
+            let item = NSMenuItem(title: option.title, action: #selector(resetCameraMenu(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = option.rawValue
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: .zero, in: sender)
+    }
+    @objc private func resetCameraMenu(_ item: NSMenuItem) {
+        if let text = item.representedObject as? String, let challenge = Challenge(rawValue: text) { resetCameraChallenge(challenge) }
+    }
+    func resetCameraChallenge(_ challenge: Challenge) {
+        guard challenge != .lockout else { return }
+        let rules = ChallengeRules.shared, now = Date()
+        guard rules.enabled(challenge) else { return }
+        let sample = lastSample
+        let other: Challenge = challenge == .posture ? .glasses : .posture
+        let field = other == .posture ? "postureScore" : "glassesScore"
+        do {
+            guard try rules.useReset(challenge, at: now) else { return }
+            if !rules.enabled(other) || rules.state.paused(other, at: now) || (sample[field] as? Double ?? 0) <= RELEASE {
+                revealScreen("challenge reset")
+            }
+            if !sample.isEmpty { handle(sample, now) }
+            flash(challenge.title + " · " + L("pausa de 2 min", "paused for 2 min"))
+        } catch { log("could not save challenge reset: \(error)") }
+    }
     func teach(_ label: String) {
         guard rest == nil, Date() >= feedbackRequestedUntil, (lastSample["training"] as? String ?? "").isEmpty else { return }
         let eyewear = label == "gafas" || label == "singafas"
@@ -1194,6 +1479,7 @@ final class Guard: NSObject, NSApplicationDelegate {
         let now = Date()
         locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
         checkTimedLockSchedule(at: now)
+        reminders.refresh(now: now)
         if let rest {
             let seconds = rest.remaining(now: now)
             showRest(seconds: seconds)
@@ -1232,9 +1518,9 @@ final class Guard: NSObject, NSApplicationDelegate {
         let remaining = (lastSample["trainingRemaining"] as? NSNumber)?.doubleValue ?? 0
         for l in liquids {
             l.title.set(message?.0 ?? head); l.why.set(message?.1 ?? line)
-            let ready = recording.isEmpty && now >= feedbackRequestedUntil
-            let action = glassesWarning ? L("Llevo mis gafas", "I’m wearing my glasses") : L("Mi postura es buena", "My posture is good")
-            l.setButton(action, enabled: ready)
+            let available = coverChallenges.filter { ChallengeRules.shared.state.allowance($0, at: now) > 0 }
+            let label = available.count > 1 ? L("Pausar reto…", "Pause challenge…") : available.first?.resetLabel ?? ""
+            l.setButton(label, enabled: !available.isEmpty)
             if !recording.isEmpty && remaining > 0 {
                 l.foot.set(L("Mantén la posición", "Hold your position") + " · \(Int(ceil(remaining))) s")
             } else {
@@ -1306,7 +1592,6 @@ final class Model: ObservableObject {
     @Published var settingsPresented = false
     @Published var cameraAvailable = true
     @Published var framingReady = false
-    @Published var glassesRequired = prefs.bool(forKey: "requireGlasses")
     @Published var glassesReady = false
     @Published var recordingLabel = ""
     @Published var recordingTime = 0.0
@@ -1470,10 +1755,20 @@ struct TimedLockSettingsView: View {
     @State private var confirmation = false
     @State private var saveFailed = false
     @State private var confirmSchedule = false
+    @ObservedObject private var rules = ChallengeRules.shared
     @Environment(\.dismiss) private var dismiss
 
     private var minutes: Int { selection == Self.custom ? customMinutes ?? 0 : selection }
     private var validDuration: Bool { (1...TimedLock.maximumMinutes).contains(minutes) }
+    private var scheduleIssue: String? { rules.state.scheduleError(schedule, previous: savedSchedule, at: Date()) }
+
+    private func saveSchedule() {
+        do {
+            try rules.saveSchedule(schedule)
+            savedSchedule = TimedLockSchedule.load()
+            if savedSchedule.enabled { g.reminders.requestPermission() }
+        } catch { saveFailed = true }
+    }
 
     private func time(_ path: WritableKeyPath<TimedLockSchedule, Int>) -> Binding<Date> {
         Binding(get: { TimedLockSchedule.pickerDate(schedule[keyPath: path]) },
@@ -1486,9 +1781,9 @@ struct TimedLockSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(L("Bloqueo temporal", "Timed Lock")).font(.title2.bold())
+            Text(Challenge.lockout.title).font(.title2.bold())
             Text(L("Cubre todas las pantallas hasta que termine la cuenta, sin opción para salir antes desde Postura.",
-                   "Cover every display until the countdown ends. There’s no early exit in Postura."))
+                   "Cover every display until the countdown ends. One weekly reset gives you two hours before the lock resumes."))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -1516,15 +1811,14 @@ struct TimedLockSettingsView: View {
 
             Divider()
             Toggle(L("Horario diario", "Daily schedule"), isOn: $schedule.enabled)
+                .disabled(rules.state.isCommitted(.lockout, at: Date()))
             HStack(spacing: 20) {
                 DatePicker(L("Desde", "From"), selection: time(\.start), displayedComponents: .hourAndMinute)
                 DatePicker(L("Hasta", "Until"), selection: time(\.end), displayedComponents: .hourAndMinute)
             }
             .disabled(!schedule.enabled)
-            Text(!schedule.isValid && schedule.enabled
-                 ? L("Elige horas diferentes.", "Choose different start and end times.")
-                 : L("Hora local del Mac. Puedes elegir un intervalo que cruce medianoche.",
-                     "Your Mac’s local time. The schedule can cross midnight."))
+            Text(scheduleIssue ?? L("Avisos 60, 15 y 5 min antes. El modo diario usa la hora local.",
+                                     "Reminders 60, 15 and 5 min before. The daily schedule uses local time."))
                 .font(.caption).foregroundStyle(.secondary)
 
             HStack {
@@ -1532,9 +1826,9 @@ struct TimedLockSettingsView: View {
                 Spacer()
                 Button(L("Guardar horario", "Save schedule")) {
                     if schedule.enabled { confirmSchedule = true }
-                    else { schedule.save(); savedSchedule = schedule }
+                    else { saveSchedule() }
                 }
-                .disabled(schedule == savedSchedule || !schedule.isValid)
+                .disabled(schedule == savedSchedule || scheduleIssue != nil)
             }
         }
         .padding(24)
@@ -1551,16 +1845,85 @@ struct TimedLockSettingsView: View {
         }
         .alert(L("¿Guardar el horario diario?", "Save the daily schedule?"), isPresented: $confirmSchedule) {
             Button(L("Cancelar", "Cancel"), role: .cancel) {}
-            Button(L("Guardar horario", "Save schedule")) { schedule.save(); savedSchedule = schedule }
+            Button(L("Guardar horario", "Save schedule")) { saveSchedule() }
         } message: {
             Text(L("Postura cubrirá todas las pantallas cada día de \(scheduleLabel).",
                    "Postura will cover every display each day during \(scheduleLabel)."))
         }
-        .alert(L("No se pudo iniciar el bloqueo", "Could not start Timed Lock"), isPresented: $saveFailed) {
+        .alert(L("No se pudo iniciar el bloqueo", "Could not save Healthy Lockout"), isPresented: $saveFailed) {
             Button(L("Aceptar", "OK"), role: .cancel) {}
         } message: {
             Text(L("Postura no pudo guardar el temporizador. La pantalla sigue disponible.",
                    "Postura could not save the timer. Your screen is still available."))
+        }
+    }
+}
+
+struct ChallengeSettingsRow: View {
+    let challenge: Challenge
+    @ObservedObject private var rules = ChallengeRules.shared
+    @State private var days = 7
+    @State private var confirm = false
+    @State private var saveFailed = false
+    var openSchedule: () -> Void
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 10)) { context in
+            let now = context.date
+            let committed = rules.state.isCommitted(challenge, at: now)
+            let enabled = rules.enabled(challenge)
+            let available = rules.state.allowance(challenge, at: now)
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Label(challenge.title, systemImage: challenge.symbol).fontWeight(.medium)
+                    Spacer()
+                    if challenge == .lockout {
+                        Button(L("Configurar…", "Configure…"), action: openSchedule).glassControl()
+                    } else {
+                        Toggle(challenge.title, isOn: Binding(get: { rules.enabled(challenge) }, set: { value in
+                            do { try rules.setEnabled(challenge, value) } catch { saveFailed = true }
+                        }))
+                        .labelsHidden().toggleStyle(.switch).disabled(committed)
+                    }
+                }
+                HStack {
+                    Text(challenge == .lockout
+                         ? L("\(available) de 1 por semana", "\(available) of 1 weekly reset available")
+                         : L("\(available) de 3 hoy", "\(available) of 3 daily resets available"))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if challenge != .lockout {
+                        Button(challenge.resetLabel) { g.resetCameraChallenge(challenge) }
+                            .disabled(!enabled || available == 0 || rules.state.paused(challenge, at: now))
+                    }
+                }
+                if committed, let end = rules.state.commitments[challenge] {
+                    Label(end.formatted(date: .abbreviated, time: .shortened), systemImage: "lock.fill")
+                        .font(.caption).foregroundStyle(.secondary).accessibilityLabel(L("Fin del reto", "Commitment ends") + " " + end.formatted())
+                } else {
+                    Menu(L("Empezar reto", "Start challenge")) {
+                        ForEach([7, 14, 30], id: \.self) { duration in
+                            Button(L("\(duration) días", "\(duration) days")) { days = duration; confirm = true }
+                        }
+                    }.fixedSize()
+                }
+            }
+            .padding(.vertical, 3)
+        }
+        .alert(L("¿Empezar reto de \(days) días?", "Start a \(days)-day challenge?"), isPresented: $confirm) {
+            Button(L("Cancelar", "Cancel"), role: .cancel) {}
+            Button(L("Empezar", "Start")) {
+                do {
+                    try rules.commit(challenge, days: days)
+                    if challenge == .lockout { g.reminders.requestPermission() }
+                } catch { saveFailed = true }
+            }
+        } message: {
+            Text(L("Activa \(challenge.title). No se puede desactivar desde Postura hasta que termine.",
+                   "Turns on \(challenge.title). You can turn it off in Postura after the commitment ends."))
+        }
+        .alert(L("No se pudo guardar el reto", "Could not save the challenge"), isPresented: $saveFailed) {
+            Button("OK", role: .cancel) {}
         }
     }
 }
@@ -1580,13 +1943,12 @@ struct PosturaSettingsView: View {
                     prefs.set(value, forKey: "cameraDevice")
                     shell.relaunch()
                 }
-                Toggle(L("Exigir gafas", "Require glasses"), isOn: $model.glassesRequired)
-                    .onChange(of: model.glassesRequired) { _, value in
-                        prefs.set(value, forKey: "requireGlasses")
-                        g.eye.restart()
+                Section(L("Retos", "Challenges")) {
+                    ForEach(Challenge.allCases) { challenge in
+                        ChallengeSettingsRow(challenge: challenge) { advancedPresented = true }
                     }
-                    .disabled(!model.recordingLabel.isEmpty)
-                if model.glassesRequired {
+                }
+                Section(L("Calibración de gafas", "Glasses calibration")) {
                     Text(model.glassesReady
                          ? L("Puedes actualizar tus ejemplos con la cámara.", "Update your glasses examples with the camera.")
                          : L("Graba un ejemplo con gafas y otro sin ellas.", "Record one example with glasses and one without."))
@@ -1610,16 +1972,13 @@ struct PosturaSettingsView: View {
                     else { prefs.set(value, forKey: "language") }
                     shell.relaunch()
                 }
-                Section(L("Avanzado", "Advanced")) {
-                    Button(L("Bloqueo temporal…", "Timed Lock…")) { advancedPresented = true }
-                }
             }
             .formStyle(.grouped)
             Button(L("Listo", "Done")) { dismiss() }
                 .keyboardShortcut(.defaultAction)
                 .padding([.trailing, .bottom], 18)
         }
-        .frame(width: 438, height: model.glassesRequired ? 426 : 310)
+        .frame(width: 510, height: 630)
         .sheet(isPresented: $advancedPresented) { TimedLockSettingsView() }
     }
 }

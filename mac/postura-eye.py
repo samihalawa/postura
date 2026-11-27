@@ -199,8 +199,10 @@ def judge(m):
         if len(near):
             pm = float(y[near].mean()); p = (len(near) * pm + 2 * p) / (len(near) + 2)
             if pm > 0.5 and p >= 0.5: why = W("examples")
+    m["postureScore"], m["postureWhy"] = p, why
     if CHECK_GLASSES:
         missing, kind = glasses_score(m)
+        m["glassesScore"], m["glassesKind"], m["glassesWhy"] = missing, kind, W(kind) if kind else ""
         m["glassesReady"] = glasses_reference() is not None
         if missing >= .5 and p >= .5:
             m["kind"] = "both"
