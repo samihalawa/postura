@@ -68,9 +68,9 @@ score, and reason. To test live detection with a recording, choose **OBS Virtual
 | You | Postura |
 |---|---|
 | Sit well or turn to a second screen | No new cover appears. A turned head or uncertain reading can’t start a cover. |
-| Slouch, tilt your head or shoulders clearly | After 5 seconds of clearly bad posture, a thin glow starts closing in. |
-| Keep slouching | The glow closes in over about 5 seconds, frosting the screen behind it, then covers it and blocks mouse, keyboard, Cmd-Tab and Force Quit. |
-| Sit up | After 2 seconds of corrected posture, the glow opens back out over about 2.5 seconds. |
+| Slouch, tilt your head or shoulders clearly | After 3.5 seconds of clearly bad posture, a thin glow starts closing in. |
+| Keep slouching | The glow closes in over about 3 seconds, frosting the screen behind it, then covers it and blocks mouse, keyboard, Cmd-Tab and Force Quit. |
+| Sit up | After 1.25 seconds of corrected posture, the glow opens back out over about 1.5 seconds. |
 | Leave the frame while it is warning | The cover clears when nobody is detected. |
 | Are on a video call (FaceTime, Teams, WebRTC in the browser) | Only a faint edge glow, it never blocks. |
 | Disagree with it | Press **Ctrl-Opt-Cmd-G** to label your posture, or use an available reset to pause the challenge for two minutes. |
@@ -92,8 +92,9 @@ than 22°, shoulders tilted more than 16°. The UI is in English, or Spanish whe
 ## Require glasses
 
 Turn on **Require glasses** in Settings and record one live sample **With glasses** and one **Without glasses**.
-Once both examples are ready, consistently missing glasses can gradually cover the display. The glasses check is off
-by default. Postura saves numerical examples on this Mac.
+Once both examples are ready, Postura compares the live camera view with both sets of examples. Consistently
+missing glasses can gradually cover the display. The glasses check is off by default. Postura saves numerical
+examples on this Mac.
 
 ## How it works
 

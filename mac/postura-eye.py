@@ -93,7 +93,6 @@ def measure(rgb, ts, preview=False):
                 pass
         if CHECK_GLASSES and m["eyePx"] >= 60 and abs(R[2][0]) < 0.5:
             m["_emb"] = eye_embedding(rgb, lm)
-            m["shade"] = shade(rgb, lm)
         m.update(face=True, person=True, pitch=math.degrees(math.atan2(R[2][1], R[2][2])),      # + = face turned below the camera
                  yaw=math.degrees(math.asin(max(-1, min(1, -R[2][0])))), roll=math.degrees(math.atan2(R[1][0], R[0][0])),
                  dist=-T[2][3], noseY=lm[1].y, noseX=lm[1].x)
@@ -112,16 +111,6 @@ def measure(rgb, ts, preview=False):
                      shY=shY, shTilt=math.degrees(math.atan2(dy, abs(dx) + 1e-6)), sw2=sw2,
                      neck2=(shY - m["noseY"]) / sw2, lat=(m["noseX"] - (n[11].x + n[12].x) / 2) * 4 / 3 / sw2)
     return m
-
-def shade(rgb, lm):  # eye area brightness / cheek brightness: ~1 bare eyes or clear glasses, ~0.4 dark lenses
-    H, W = rgb.shape[:2]; P = lambda i: np.array([lm[i].x * W, lm[i].y * H]); r = []
-    def med(c, w, h):
-        x0, x1, y0, y1 = int(max(0, c[0] - w / 2)), int(min(W, c[0] + w / 2)), int(max(0, c[1] - h / 2)), int(min(H, c[1] + h / 2))
-        px = rgb[y0:y1, x0:x1].astype(np.float32); return float(np.median(px @ np.float32([0.299, 0.587, 0.114]))) if px.size else float("nan")
-    for a, b, cheek in ((33, 133, 50), (263, 362, 280)):
-        w = float(np.linalg.norm(P(a) - P(b))); r.append(med((P(a) + P(b)) / 2, w * 1.5, w * 0.9) / (med(P(cheek), w * 0.5, w * 0.5) + 1e-6))
-    valid = [v for v in r if math.isfinite(v)]
-    return sum(valid) / len(valid) if valid else 1.0
 
 def eye_embedding(rgb, lm):  # aligned eye-region crop -> image features (kept as numbers, the crop is discarded)
     import cv2
@@ -152,9 +141,10 @@ def glasses_score(m):
     if any(rows.ndim != 2 or not len(rows) or rows.shape[1] != len(m["_emb"]) for rows in refs):
         return 0.0, ""
     similarity = float((with_glasses @ m["_emb"]).max() - (without_glasses @ m["_emb"]).max())
-    if m.get("shade", 1) < 0.55 and similarity <= 0:
-        return sig((0.45 - m["shade"]) / 0.03), "sunglasses"
-    return sig((-0.10 - similarity) / 0.03), "glasses"
+    # Compare both sets of calibration examples. Darkness alone cannot distinguish
+    # tinted lenses from bare eyes in shadow.
+    m["glassesMargin"] = similarity
+    return sig(-similarity / 0.025), "glasses"
 
 # ---- judgement ----
 sig = lambda z: 1 / (1 + math.exp(-max(-30, min(30, z))))

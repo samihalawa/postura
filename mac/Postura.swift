@@ -48,7 +48,7 @@ func f2(_ x: Double) -> String { String(format: "%.2f", x) }
 let BLOCK = 0.72, RELEASE = 0.40
 
 struct CoverTiming {
-    static let dwell = 5.0, fill = 5.0, clearDelay = 2.0, drain = 2.5
+    static let dwell = 3.5, fill = 3.0, clearDelay = 1.25, drain = 1.5
     private var qualifyingSince: Date?
     private var clearSince: Date?
 
